@@ -461,6 +461,7 @@ def current_qss():
 class Worker(QThread):
     status_update = pyqtSignal(int, str)   # row, status text
     groups_update = pyqtSignal(int, str)   # row, groups text
+    info_update   = pyqtSignal(int, dict)  # row, parsed account info
     log_update    = pyqtSignal(int, str, str)  # row, script, log line
     finished      = pyqtSignal(int, str)   # row, result
 
@@ -1040,6 +1041,10 @@ class DraggableTable(QTableWidget):
         self.setDropIndicatorShown(True)
         self.setDragDropMode(QAbstractItemView.InternalMove)
         self.setDragDropOverwriteMode(False)
+        self.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
         self._drag_source_row = -1
 
     def mousePressEvent(self, event):

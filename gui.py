@@ -1,4 +1,4 @@
-import sys, os, json, csv, subprocess, threading, unicodedata, zipfile
+import sys, os, json, csv, subprocess, threading, unicodedata, zipfile, re
 from datetime import datetime
 from xml.sax.saxutils import escape as xml_escape
 from PyQt5.QtWidgets import (
@@ -11,6 +11,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QMimeData
 from PyQt5.QtGui import QFont, QColor, QPalette, QIcon, QCursor, QDrag, QKeySequence
+from group_check_detail_dialog import GroupCheckDetailDialog
 
 # ── paths ──────────────────────────────────────────────────────────────────────
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -137,6 +138,11 @@ QTableWidget {
 QTableWidget::item {
     padding: 6px 10px;
     border: none;
+}
+QTableWidget::item:hover {
+    background: #24324a;
+    color: #93c5fd;
+    font-weight: 700;
 }
 QTableWidget::item:selected {
     background: #1e3a5f;
@@ -315,6 +321,11 @@ QTableWidget::item {
     padding: 6px 10px;
     border: none;
 }
+QTableWidget::item:hover {
+    background: #d7e5ff;
+    color: #1e40af;
+    font-weight: 700;
+}
 QTableWidget::item:selected {
     background: #dbeafe;
     color: #1d4ed8;
@@ -385,10 +396,10 @@ QLineEdit#cellText {
 """
 
 # ── columns ────────────────────────────────────────────────────────────────────
-COLS = ["Trạng thái","Email","Pass Acc","Group ID","Groups","Họ","Tên",
+COLS = ["Trạng thái","Email","Pass Acc","Group ID","Groups","Nhóm 1","Nhóm 2","Nhóm 3","Họ","Tên",
         "Họ 1","Tên 1","Họ phiên âm","Tên phiên âm",
         "Mã bưu điện","Địa chỉ","EID","Mã số LP","Số điện thoại"]
-ACC_KEYS = ["status","mail","passacc","group_id","groups","ho","ten",
+ACC_KEYS = ["status","mail","passacc","group_id","groups","group1","group2","group3","ho","ten",
             "ho1","ten1","hophienam","tenphienam",
             "mabuudien","diachi","eid","lp_code","sdt"]
 
@@ -542,6 +553,7 @@ class Worker(QThread):
 class CheckGroupWorker(QThread):
     status_update = pyqtSignal(int, str)
     groups_update = pyqtSignal(int, str)
+    group_details_update = pyqtSignal(int, list)
     info_update   = pyqtSignal(int, dict)
     log_update    = pyqtSignal(int, str, str)
     finished      = pyqtSignal(int, str)
@@ -587,23 +599,61 @@ class CheckGroupWorker(QThread):
             info = {}
             info.update(parse_account_info(r.text))
 
-            for url in (
-                "https://linksmate.jp/mypage/userinfo/",
-                "https://linksmate.jp/mypage/userinfo/edit/",
-                "https://linksmate.jp/mypage/customer/",
-                "https://linksmate.jp/mypage/customerinfo/",
-                "https://linksmate.jp/mypage/contract/",
-                "https://linksmate.jp/mypage/member/",
-                "https://linksmate.jp/mypage/account/",
-                "https://linksmate.jp/mypage/eid/",
-            ):
+            # Chỉ giữ lại các endpoint quan trọng cho check LP + SĐT của tài khoản.
+            # Các endpoint profile phụ không còn được gọi nữa để giảm request và tránh rác dữ liệu.
+
+            group_details = []
+            for group in groups:
+                order = str(group.get("order", ""))
+                group_id = str(group.get("id", "")).strip()
+                label = str(group.get("label", "")).strip()
                 try:
-                    rr = session.get(url)
-                    self.log_update.emit(self.row, script, f"GET {url} -> {rr.status_code} {rr.url}")
-                    if rr.status_code < 400:
-                        info.update(parse_account_info(rr.text))
+                    group_session, _, _ = do_login(mail, passacc, gmail, apppass, self.proxy, group_id)
+                    rr = group_session.get("https://linksmate.jp/mypage/")
+                    soup = BeautifulSoup(rr.text, "html.parser")
+                    lp_el = soup.select_one("#available_lp .mypage-lp__available-value")
+                    lp_text = lp_el.get_text(strip=True) if lp_el else "N/A"
+
+                    rr2 = group_session.get("https://linksmate.jp/mypage/simcardadd/")
+                    phones = []
+                    if rr2.status_code < 400:
+                        soup2 = BeautifulSoup(rr2.text, "html.parser")
+                        for td in soup2.select("td[data-label='SIMカード電話番号']"):
+                            div = td.select_one(".simcardadd__div-data")
+                            if div:
+                                phone = div.get_text(strip=True)
+                                if phone and phone not in phones:
+                                    phones.append(phone)
+                    phone_text = ", ".join(phones) if phones else "N/A"
+
+                    detail = {
+                        "order": order,
+                        "group_id": group_id,
+                        "label": label,
+                        "lp": lp_text,
+                        "phones": phones,
+                    }
+                    group_details.append(detail)
+                    self.log_update.emit(self.row, script, f"GROUP {order}:{group_id} LP={lp_text} PHONES={phone_text}")
                 except Exception as e:
-                    self.log_update.emit(self.row, script, f"WARN {url}: {e}")
+                    self.log_update.emit(self.row, script, f"WARN group {order}:{group_id}: {e}")
+                    group_details.append({
+                        "order": order,
+                        "group_id": group_id,
+                        "label": label,
+                        "lp": "N/A",
+                        "phones": [],
+                    })
+
+            if group_details:
+                for item in group_details:
+                    order = str(item.get("order", "")).strip()
+                    group_id = str(item.get("group_id", "")).strip()
+                    lp = str(item.get("lp", "N/A")).strip()
+                    phones = item.get("phones") or []
+                    phone_text = ", ".join(phones) if phones else "N/A"
+                    info[f"group{order}"] = f"{group_id} | {lp} | {phone_text}"
+                self.group_details_update.emit(self.row, group_details)
 
             try:
                 rr = session.get("https://linksmate.jp/mypage/simcardadd/")
@@ -617,7 +667,7 @@ class CheckGroupWorker(QThread):
                             phone = div.get_text(strip=True)
                             if phone and phone not in phones:
                                 phones.append(phone)
-                    if phones:
+                    if phones and "sdt" not in info:
                         info["sdt"] = "\n".join(phones)
             except Exception as e:
                 self.log_update.emit(self.row, script, f"WARN simcardadd: {e}")
@@ -1135,6 +1185,13 @@ class AccountsTab(QWidget):
         self.e_search.textChanged.connect(self._on_search_changed)
         search_row.addWidget(self.e_search, 1)
 
+        btn_select_all = QPushButton("Chọn All")
+        btn_select_all.clicked.connect(self._select_all_visible)
+        search_row.addWidget(btn_select_all)
+
+        btn_clear_selection = QPushButton("Bỏ chọn All")
+        btn_clear_selection.clicked.connect(self._clear_selection)
+        search_row.addWidget(btn_clear_selection)
         layout.addLayout(search_row)
 
         page_row = QHBoxLayout()
@@ -1175,7 +1232,7 @@ class AccountsTab(QWidget):
         self.table.customContextMenuRequested.connect(self._context_menu)
         self.table.row_moved.connect(self._move_row)
         # col widths
-        widths = [120,200,110,110,90,190,80,80,80,80,110,110,100,160,200,120]
+        widths = [120,200,110,110,90,220,220,220,80,80,80,80,110,110,100,160,200,120,140]
         for i,w in enumerate(widths):
             self.table.setColumnWidth(i, w)
 
@@ -1260,7 +1317,7 @@ class AccountsTab(QWidget):
             widget.setObjectName("cellText")
             widget.setReadOnly(True)
             widget.setFrame(False)
-            widget.setContextMenuPolicy(Qt.DefaultContextMenu)
+            widget.setContextMenuPolicy(Qt.NoContextMenu)
             widget.setFocusPolicy(Qt.StrongFocus)
             self.table.setCellWidget(row, col, widget)
         widget.setText(text)
@@ -1419,6 +1476,7 @@ class AccountsTab(QWidget):
         worker = CheckGroupWorker(row, acc, sett, proxy)
         worker.status_update.connect(self._set_status)
         worker.groups_update.connect(self._on_worker_groups_update)
+        worker.group_details_update.connect(self._show_group_check_result_dialog)
         worker.log_update.connect(self._append_log)
         worker.finished.connect(self._on_finished)
         self.workers[row] = worker
@@ -1465,11 +1523,11 @@ class AccountsTab(QWidget):
         groups = []
         for part in str(groups_text or "").split("|"):
             part = part.strip()
-            if ":" not in part:
+            match = re.search(r"(\d+)\s*:\s*(\d+)", part)
+            if not match:
                 continue
-            order, group_id = [p.strip() for p in part.split(":", 1)]
-            if order.isdigit() and group_id.isdigit():
-                groups.append((order, group_id))
+            order, group_id = match.groups()
+            groups.append((order, group_id))
         return groups
 
     def _group_id_by_order(self, groups_text: str, order: str):
@@ -1490,6 +1548,16 @@ class AccountsTab(QWidget):
                 self.accounts[row]["group_id"] = first_group_id
         self._update_row(row, self.accounts[row])
         save_accounts(self.accounts)
+
+    def _show_group_check_result_dialog(self, row: int, details: list):
+        if row >= len(self.accounts):
+            return
+        if not details:
+            return
+        mail = self.accounts[row].get("mail", f"dòng {row + 1}")
+        QMessageBox.information(self, "Check nhóm hoàn tất", f"Đã lấy xong thông tin cho {mail}.")
+        dlg = GroupCheckDetailDialog(mail, details, self)
+        dlg.exec_()
 
     def _on_worker_info_update(self, row: int, info: dict):
         if row >= len(self.accounts):
@@ -1736,10 +1804,6 @@ class AccountsTab(QWidget):
             a_edit.triggered.connect(lambda: self._edit_row(row))
             menu.addAction(a_edit)
 
-            a_copy_cell = QAction("📋  Copy ô này", self)
-            a_copy_cell.triggered.connect(lambda: self._copy_cell_at(row, self.table.columnAt(pos.x())))
-            menu.addAction(a_copy_cell)
-
             menu.addSeparator()
             a_create = QAction("▶  Tạo tài khoản  (test1.py)", self)
             a_create.triggered.connect(lambda: self._run_row(row,"test1.py"))
@@ -1792,8 +1856,12 @@ class AccountsTab(QWidget):
             save_accounts(self.accounts)
 
     def _delete_row(self, row: int):
-        if QMessageBox.question(self,"Xác nhận","Xóa dòng này?",
-                                QMessageBox.Yes|QMessageBox.No) != QMessageBox.Yes:
+        if QMessageBox.question(
+            self,
+            "Xác nhận cuối cùng",
+            "Bạn đang thực hiện xóa dòng này.\n\nBạn có chắc chắn muốn xóa không?\nHành động này sẽ xóa vĩnh viễn dữ liệu của dòng đang chọn.",
+            QMessageBox.Yes | QMessageBox.No
+        ) != QMessageBox.Yes:
             return
         self.table.removeRow(row)
         if row < len(self.accounts):

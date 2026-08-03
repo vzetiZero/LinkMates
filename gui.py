@@ -396,11 +396,13 @@ QLineEdit#cellText {
 """
 
 # ── columns ────────────────────────────────────────────────────────────────────
-COLS = ["Trạng thái","Email","Pass Acc","Group ID","Groups","Nhóm 1","Nhóm 2","Nhóm 3","Họ","Tên",
-        "Họ 1","Tên 1","Họ phiên âm","Tên phiên âm",
+COLS = ["Trạng thái","Email","Group ID","Groups",
+        "Nhóm 1","LP Nhóm 1","Nhóm 2","LP Nhóm 2","Nhóm 3","LP Nhóm 3",
+        "Họ","Tên","Họ 1","Tên 1","Họ phiên âm","Tên phiên âm",
         "Mã bưu điện","Địa chỉ","EID","Mã số LP","Số điện thoại"]
-ACC_KEYS = ["status","mail","passacc","group_id","groups","group1","group2","group3","ho","ten",
-            "ho1","ten1","hophienam","tenphienam",
+ACC_KEYS = ["status","mail","group_id","groups",
+            "group1","lp1","group2","lp2","group3","lp3",
+            "ho","ten","ho1","ten1","hophienam","tenphienam",
             "mabuudien","diachi","eid","lp_code","sdt"]
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -652,7 +654,9 @@ class CheckGroupWorker(QThread):
                     lp = str(item.get("lp", "N/A")).strip()
                     phones = item.get("phones") or []
                     phone_text = ", ".join(phones) if phones else "N/A"
-                    info[f"group{order}"] = f"{group_id} | {lp} | {phone_text}"
+                    info[f"group{order}"] = phone_text
+                    info[f"lp{order}"] = lp
+                    info[f"group{order}_id"] = group_id
                 self.group_details_update.emit(self.row, group_details)
 
             try:
@@ -1232,12 +1236,12 @@ class AccountsTab(QWidget):
         self.table.customContextMenuRequested.connect(self._context_menu)
         self.table.row_moved.connect(self._move_row)
         # col widths
-        widths = [120,200,110,110,90,220,220,220,80,80,80,80,110,110,100,160,200,120,140]
+        widths = [120,200,110,90,220,90,220,90,220,90,80,80,80,80,110,110,100,160,200,120,140]
         for i,w in enumerate(widths):
             self.table.setColumnWidth(i, w)
 
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
+        self.right_panel = QWidget()
+        right_layout = QVBoxLayout(self.right_panel)
         right_layout.setContentsMargins(0,0,0,0)
         right_layout.setSpacing(8)
 
@@ -1246,6 +1250,9 @@ class AccountsTab(QWidget):
         lbl_log.setStyleSheet("color:#60a5fa;font-weight:700;")
         log_toolbar.addWidget(lbl_log)
         log_toolbar.addStretch()
+        self.btn_toggle_log = QPushButton("Thu gọn")
+        self.btn_toggle_log.clicked.connect(self._toggle_log_panel)
+        log_toolbar.addWidget(self.btn_toggle_log)
         btn_clear_log = QPushButton("Clear Log")
         btn_clear_log.clicked.connect(self._clear_log)
         log_toolbar.addWidget(btn_clear_log)
@@ -1257,13 +1264,14 @@ class AccountsTab(QWidget):
         self.txt_log.setPlaceholderText("Log request sẽ hiển thị ở đây...")
         right_layout.addWidget(self.txt_log, 1)
 
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(self.table)
-        splitter.addWidget(right_panel)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([900, 360])
-        layout.addWidget(splitter, 1)
+        self.splitter = QSplitter(Qt.Horizontal)
+        self.splitter.addWidget(self.table)
+        self.splitter.addWidget(self.right_panel)
+        self.splitter.setStretchFactor(0, 3)
+        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setCollapsible(1, True)
+        self.splitter.setSizes([900, 360])
+        layout.addWidget(self.splitter, 1)
 
     # ── table helpers ──────────────────────────────────────────────────────────
     def _load_table(self):
@@ -1405,6 +1413,20 @@ class AccountsTab(QWidget):
         if hasattr(self, "txt_log"):
             self.txt_log.clear()
 
+    def _toggle_log_panel(self):
+        if not hasattr(self, "right_panel") or not hasattr(self, "btn_toggle_log"):
+            return
+        if self.right_panel.isVisible():
+            self.right_panel.hide()
+            self.btn_toggle_log.setText("Mở")
+            if hasattr(self, "splitter"):
+                self.splitter.setSizes([self.splitter.width(), 0])
+        else:
+            self.right_panel.show()
+            self.btn_toggle_log.setText("Thu gọn")
+            if hasattr(self, "splitter"):
+                self.splitter.setSizes([900, 360])
+
     def _copy_cell_at(self, row: int, col: int):
         if row < 0 or col <= 0:
             return
@@ -1476,6 +1498,7 @@ class AccountsTab(QWidget):
         worker = CheckGroupWorker(row, acc, sett, proxy)
         worker.status_update.connect(self._set_status)
         worker.groups_update.connect(self._on_worker_groups_update)
+        worker.info_update.connect(self._on_worker_info_update)
         worker.group_details_update.connect(self._show_group_check_result_dialog)
         worker.log_update.connect(self._append_log)
         worker.finished.connect(self._on_finished)
@@ -1540,12 +1563,6 @@ class AccountsTab(QWidget):
         if row >= len(self.accounts):
             return
         self.accounts[row]["groups"] = groups_text
-        group_ids = [group_id for _, group_id in self._parse_groups_text(groups_text)]
-        current_group_id = self.accounts[row].get("group_id", "")
-        if not current_group_id or current_group_id not in group_ids:
-            first_group_id = group_ids[0] if group_ids else ""
-            if first_group_id:
-                self.accounts[row]["group_id"] = first_group_id
         self._update_row(row, self.accounts[row])
         save_accounts(self.accounts)
 
@@ -1818,6 +1835,14 @@ class AccountsTab(QWidget):
                 group_items = [("1", self.accounts[row].get("group_id", ""))]
             for group_order, group_id in group_items:
                 group_menu = QMenu(f"👥  Nhóm {group_order}", self)
+
+                a_buoc1 = QAction(f"▶  Bước 1  (buoc1.py) - Nhóm {group_order}", self)
+                a_buoc1.triggered.connect(lambda checked=False, gid=group_id: self._run_row_group(row, "buoc1.py", gid))
+                group_menu.addAction(a_buoc1)
+
+                a_task2 = QAction(f"▶  Nhiệm vụ 2  (test2.py) - Nhóm {group_order}", self)
+                a_task2.triggered.connect(lambda checked=False, gid=group_id: self._run_row_group(row, "test2.py", gid))
+                group_menu.addAction(a_task2)
 
                 a_group = QAction(f"▶  Làm nhiệm vụ Nhóm {group_order}  (test3.py)", self)
                 a_group.triggered.connect(lambda checked=False, gid=group_id: self._run_row_group(row, "test3.py", gid))

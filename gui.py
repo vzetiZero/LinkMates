@@ -397,11 +397,11 @@ QLineEdit#cellText {
 
 # ── columns ────────────────────────────────────────────────────────────────────
 COLS = ["Trạng thái","Email","Group ID","Groups",
-        "Nhóm 1","LP Nhóm 1","Nhóm 2","LP Nhóm 2","Nhóm 3","LP Nhóm 3",
+        "SĐT Nhóm 1","SĐT Nhóm 2","SĐT  Nhóm 3","LP",
         "Họ","Tên","Họ 1","Tên 1","Họ phiên âm","Tên phiên âm",
         "Mã bưu điện","Địa chỉ","EID","Mã số LP","Số điện thoại"]
 ACC_KEYS = ["status","mail","group_id","groups",
-            "group1","lp1","group2","lp2","group3","lp3",
+            "group1","group2","group3","lp1",
             "ho","ten","ho1","ten1","hophienam","tenphienam",
             "mabuudien","diachi","eid","lp_code","sdt"]
 
@@ -1236,7 +1236,7 @@ class AccountsTab(QWidget):
         self.table.customContextMenuRequested.connect(self._context_menu)
         self.table.row_moved.connect(self._move_row)
         # col widths
-        widths = [120,200,110,90,220,90,220,90,220,90,80,80,80,80,110,110,100,160,200,120,140]
+        widths = [120,200,110,90,220,220,220,90,80,80,80,80,110,110,100,160,200,120,140]
         for i,w in enumerate(widths):
             self.table.setColumnWidth(i, w)
 

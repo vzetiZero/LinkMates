@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+
+# Local credentials and account data
+accounts.json
+settings.json
+data.json
+
+# Local scratch/browser captures
+*.html
+*.log
+*.tmp

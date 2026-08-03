@@ -1,0 +1,10 @@
+{
+  "GMAIL_MAIN": "your-gmail@example.com",
+  "GMAIL_APP_PASSWORD": "your-gmail-app-password",
+  "prefecture": "東京都",
+  "city": "千代田区丸の内",
+  "address": "1-1",
+  "password": "Pass@12345",
+  "proxies": "",
+  "theme": "dark"
+}

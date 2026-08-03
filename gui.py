@@ -385,10 +385,10 @@ QLineEdit#cellText {
 """
 
 # ── columns ────────────────────────────────────────────────────────────────────
-COLS = ["Chọn","Trạng thái","Email","Pass Mail","Pass Acc","Group ID","Groups","Họ","Tên",
+COLS = ["Trạng thái","Email","Pass Acc","Group ID","Groups","Họ","Tên",
         "Họ 1","Tên 1","Họ phiên âm","Tên phiên âm",
         "Mã bưu điện","Địa chỉ","EID","Mã số LP","Số điện thoại"]
-ACC_KEYS = ["status","mail","passmail","passacc","group_id","groups","ho","ten",
+ACC_KEYS = ["status","mail","passacc","group_id","groups","ho","ten",
             "ho1","ten1","hophienam","tenphienam",
             "mabuudien","diachi","eid","lp_code","sdt"]
 
@@ -1204,7 +1204,7 @@ class AccountsTab(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.verticalHeader().setDefaultSectionSize(34)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectItems)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
@@ -1212,7 +1212,7 @@ class AccountsTab(QWidget):
         self.table.customContextMenuRequested.connect(self._context_menu)
         self.table.row_moved.connect(self._move_row)
         # col widths
-        widths = [58,120,200,110,110,90,190,80,80,80,80,110,110,100,160,200,120,120]
+        widths = [120,200,110,110,90,190,80,80,80,80,110,110,100,160,200,120]
         for i,w in enumerate(widths):
             self.table.setColumnWidth(i, w)
 
@@ -1255,17 +1255,12 @@ class AccountsTab(QWidget):
     def _append_row(self, acc: dict):
         r = self.table.rowCount()
         self.table.insertRow(r)
-        check_item = QTableWidgetItem("")
-        check_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable)
-        check_item.setCheckState(Qt.Unchecked)
-        check_item.setTextAlignment(Qt.AlignCenter)
-        self.table.setItem(r, 0, check_item)
-        for c, key in enumerate(ACC_KEYS, start=1):
+        for c, key in enumerate(ACC_KEYS):
             val = acc.get(key, "")
             self._set_cell_text(r, c, val, center=(key == "status"))
 
     def _update_row(self, row: int, acc: dict):
-        for c, key in enumerate(ACC_KEYS, start=1):
+        for c, key in enumerate(ACC_KEYS):
             self._set_cell_text(row, c, acc.get(key, ""), center=(key == "status"))
 
     def _set_status(self, row: int, text: str):
@@ -1353,36 +1348,23 @@ class AccountsTab(QWidget):
         return [row for row in range(self.table.rowCount()) if not self.table.isRowHidden(row)]
 
     def _checked_rows(self):
-        rows = []
-        for row in range(self.table.rowCount()):
-            item = self.table.item(row, 0)
-            if item and item.checkState() == Qt.Checked:
-                rows.append(row)
-        return rows
+        return []
 
     def _target_rows(self):
-        checked = self._checked_rows()
-        if checked:
-            return checked
         selected = sorted({i.row() for i in self.table.selectedItems()})
         return selected
 
     def _select_all_visible(self):
         self.table.setUpdatesEnabled(False)
+        self.table.clearSelection()
         for row in self._visible_rows():
-            item = self.table.item(row, 0)
-            if item:
-                item.setCheckState(Qt.Checked)
+            self.table.selectRow(row)
         self.table.setUpdatesEnabled(True)
 
     def _clear_selection(self):
         if not hasattr(self, "table"):
             return
         self.table.setUpdatesEnabled(False)
-        for row in self._visible_rows():
-            item = self.table.item(row, 0)
-            if item:
-                item.setCheckState(Qt.Unchecked)
         self.table.clearSelection()
         self.table.setUpdatesEnabled(True)
 
@@ -1601,9 +1583,6 @@ class AccountsTab(QWidget):
         save_accounts(self.accounts)
         self._apply_filter()
         new_row = self.table.rowCount() - 1
-        item = self.table.item(new_row, 0)
-        if item:
-            item.setCheckState(Qt.Checked)
         self.table.scrollToItem(self.table.item(new_row, 0))
 
     def insert_row_above(self):
@@ -1618,12 +1597,7 @@ class AccountsTab(QWidget):
         acc["status"] = "Mới"
         self.accounts.insert(insert_at, acc)
         self.table.insertRow(insert_at)
-        check_item = QTableWidgetItem("")
-        check_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable)
-        check_item.setCheckState(Qt.Checked)
-        check_item.setTextAlignment(Qt.AlignCenter)
-        self.table.setItem(insert_at, 0, check_item)
-        for c, key in enumerate(ACC_KEYS, start=1):
+        for c, key in enumerate(ACC_KEYS):
             self._set_cell_text(insert_at, c, acc.get(key, ""), center=(key == "status"))
         save_accounts(self.accounts)
         self._apply_filter()
@@ -1637,9 +1611,6 @@ class AccountsTab(QWidget):
         self.accounts.insert(to_row, acc)
         self._load_table()
         save_accounts(self.accounts)
-        item = self.table.item(to_row, 0)
-        if item:
-            item.setCheckState(Qt.Checked)
 
     # ── import ─────────────────────────────────────────────────────────────────
     def import_file(self):
@@ -1685,7 +1656,7 @@ class AccountsTab(QWidget):
             path += ".xlsx"
 
         try:
-            self._write_xlsx(path, COLS[1:], ACC_KEYS, self.accounts)
+            self._write_xlsx(path, COLS, ACC_KEYS, self.accounts)
             QMessageBox.information(self, "Xuất xong", f"Đã xuất {len(self.accounts)} tài khoản:\n{path}")
         except Exception as e:
             QMessageBox.critical(self, "Lỗi xuất file", str(e))

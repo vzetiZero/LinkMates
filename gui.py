@@ -1065,37 +1065,7 @@ class DraggableTable(QTableWidget):
         event.accept()
 
     def keyPressEvent(self, event):
-        if event.matches(QKeySequence.Copy):
-            self._copy_selected_cells()
-            return
         super().keyPressEvent(event)
-
-    def _copy_selected_cells(self):
-        indexes = sorted(self.selectedIndexes(), key=lambda i: (i.row(), i.column()))
-        if not indexes:
-            item = self.currentItem()
-            if item:
-                QApplication.clipboard().setText(item.data(Qt.UserRole) or item.text())
-            return
-        rows = {}
-        for index in indexes:
-            if self.isRowHidden(index.row()) or index.column() == 0:
-                continue
-            item = self.item(index.row(), index.column())
-            widget = self.cellWidget(index.row(), index.column())
-            if isinstance(widget, QLineEdit):
-                text = widget.selectedText() or widget.text()
-            else:
-                text = (item.data(Qt.UserRole) or item.text()) if item else ""
-            rows.setdefault(index.row(), {})[index.column()] = text
-        if not rows:
-            return
-        min_col = min(col for cols in rows.values() for col in cols)
-        max_col = max(col for cols in rows.values() for col in cols)
-        lines = []
-        for row in sorted(rows):
-            lines.append("\t".join(rows[row].get(col, "") for col in range(min_col, max_col + 1)))
-        QApplication.clipboard().setText("\n".join(lines))
 
 # ── Accounts tab ───────────────────────────────────────────────────────────────
 class AccountsTab(QWidget):
@@ -1105,7 +1075,7 @@ class AccountsTab(QWidget):
         self.accounts     = load_accounts()
         self.workers      = {}   # row -> Worker
         self._proxy_index = 0
-        self.page_size    = 50
+        self.page_size    = 60
         self.current_page = 0
         self.filtered_rows = []
         self._build_ui()
@@ -1138,7 +1108,7 @@ class AccountsTab(QWidget):
         self.btn_create_acc.setObjectName("btnSuccess")
         self.btn_create_acc.clicked.connect(lambda: self._run_selected("test1.py","⏳ Tạo TK"))
 
-        self.btn_task3 = QPushButton("▶  Nhiệm vụ Nhóm 1")
+        self.btn_task3 = QPushButton("▶  Nhóm 1")
         self.btn_task3.setObjectName("btnWarning")
         self.btn_task3.clicked.connect(lambda: self._run_selected_group1())
 
@@ -1165,13 +1135,6 @@ class AccountsTab(QWidget):
         self.e_search.textChanged.connect(self._on_search_changed)
         search_row.addWidget(self.e_search, 1)
 
-        btn_select_all = QPushButton("Chọn All")
-        btn_select_all.clicked.connect(self._select_all_visible)
-        search_row.addWidget(btn_select_all)
-
-        btn_clear_selection = QPushButton("Bỏ chọn All")
-        btn_clear_selection.clicked.connect(self._clear_selection)
-        search_row.addWidget(btn_clear_selection)
         layout.addLayout(search_row)
 
         page_row = QHBoxLayout()
@@ -1189,7 +1152,7 @@ class AccountsTab(QWidget):
         page_row.addStretch()
         for w in [self.btn_first_page, self.btn_prev_page, self.lbl_page, self.btn_next_page, self.btn_last_page]:
             page_row.addWidget(w)
-        page_row.addWidget(QLabel("50 row/trang"))
+        page_row.addWidget(QLabel("60 row/trang"))
         layout.addLayout(page_row)
 
         # Track completion status for sequential workflow
@@ -1777,10 +1740,6 @@ class AccountsTab(QWidget):
             a_copy_cell.triggered.connect(lambda: self._copy_cell_at(row, self.table.columnAt(pos.x())))
             menu.addAction(a_copy_cell)
 
-            a_copy_row = QAction("📋  Copy dòng này", self)
-            a_copy_row.triggered.connect(lambda: self._copy_row(row))
-            menu.addAction(a_copy_row)
-
             menu.addSeparator()
             a_create = QAction("▶  Tạo tài khoản  (test1.py)", self)
             a_create.triggered.connect(lambda: self._run_row(row,"test1.py"))
@@ -1794,18 +1753,21 @@ class AccountsTab(QWidget):
             if not group_items:
                 group_items = [("1", self.accounts[row].get("group_id", ""))]
             for group_order, group_id in group_items:
-                a_group = QAction(f"▶  Làm Nhiệm vụ Nhóm {group_order}  (test3.py)", self)
+                group_menu = QMenu(f"👥  Nhóm {group_order}", self)
+
+                a_group = QAction(f"▶  Làm nhiệm vụ Nhóm {group_order}  (test3.py)", self)
                 a_group.triggered.connect(lambda checked=False, gid=group_id: self._run_row_group(row, "test3.py", gid))
-                menu.addAction(a_group)
+                group_menu.addAction(a_group)
 
-            a_xoa = QAction("📵  Xóa số  (xoaso.py)", self)
-            a_xoa.triggered.connect(lambda: self._run_row(row,"xoaso.py"))
-            menu.addAction(a_xoa)
+                a_xoa = QAction("📵  Xóa số  (xoaso.py)", self)
+                a_xoa.triggered.connect(lambda checked=False, gid=group_id: self._run_row_group(row, "xoaso.py", gid))
+                group_menu.addAction(a_xoa)
 
-            menu.addSeparator()
-            a_lp = QAction("💎  Xem LP & Danh sách SĐT", self)
-            a_lp.triggered.connect(lambda: self._show_lp_info(row))
-            menu.addAction(a_lp)
+                a_lp = QAction("💎  Xem LP & Danh sách SĐT", self)
+                a_lp.triggered.connect(lambda checked=False, gid=group_id: self._show_lp_info(row, gid))
+                group_menu.addAction(a_lp)
+
+                menu.addMenu(group_menu)
 
             a_charge = QAction("🚀  Tạo LP (mua LP)", self)
             a_charge.triggered.connect(lambda: self._create_lp(row))
@@ -1839,11 +1801,13 @@ class AccountsTab(QWidget):
         save_accounts(self.accounts)
         self._apply_filter()
 
-    def _show_lp_info(self, row: int):
+    def _show_lp_info(self, row: int, group_id: str = ""):
         """Login và hiển thị LP + danh sách SĐT của tài khoản"""
         if row >= len(self.accounts):
             return
         acc = dict(self.accounts[row])
+        if group_id:
+            acc["group_id"] = str(group_id)
         acc["_proxy"] = self._next_proxy()
         sett = self.settings_tab.get_settings()
         mail = acc.get("mail", f"dòng {row + 1}")
@@ -1859,11 +1823,13 @@ class AccountsTab(QWidget):
 
         dlg.exec_()
 
-    def _create_lp(self, row: int):
+    def _create_lp(self, row: int, group_id: str = ""):
         """Mở dialog nhập số LP → chạy worker → lưu mã số vào cột lp_code"""
         if row >= len(self.accounts):
             return
         acc  = dict(self.accounts[row])
+        if group_id:
+            acc["group_id"] = str(group_id)
         acc["_proxy"] = self._next_proxy()
         sett = self.settings_tab.get_settings()
         mail = acc.get("mail", f"dòng {row + 1}")

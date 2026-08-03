@@ -1,5 +1,6 @@
-import sys, os, json, csv, subprocess, threading, unicodedata
+import sys, os, json, csv, subprocess, threading, unicodedata, zipfile
 from datetime import datetime
+from xml.sax.saxutils import escape as xml_escape
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView,
@@ -1018,6 +1019,8 @@ class AccountsTab(QWidget):
         btn_del  = QPushButton("🗑  Xóa đã chọn")
         btn_del.setObjectName("btnDanger")
         btn_del.clicked.connect(self.delete_selected)
+        btn_export = QPushButton("📤  Xuất Excel")
+        btn_export.clicked.connect(self.export_excel)
 
         # Sequential workflow buttons
         self.btn_create_acc = QPushButton("▶  Tạo tài khoản")
@@ -1034,7 +1037,7 @@ class AccountsTab(QWidget):
         btn_xoa.clicked.connect(lambda: self._run_selected("xoaso.py","⏳ Xóa số"))
 
         # Add buttons to toolbar
-        for b in [btn_add, btn_add_empty, btn_insert, btn_del, self.btn_create_acc, self.btn_task3, btn_xoa]:
+        for b in [btn_add, btn_add_empty, btn_insert, btn_del, btn_export, self.btn_create_acc, self.btn_task3, btn_xoa]:
             toolbar.addWidget(b)
         toolbar.addStretch()
 
@@ -1491,6 +1494,96 @@ class AccountsTab(QWidget):
         save_accounts(self.accounts)
         self._apply_filter()
         QMessageBox.information(self, "Nhập xong", f"Đã thêm {added} tài khoản.")
+
+    def export_excel(self):
+        default_name = datetime.now().strftime("%d-%m-%Y.xlsx")
+        default_path = os.path.join(BASE, default_name)
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Chọn nơi lưu file Excel",
+            default_path,
+            "Excel Workbook (*.xlsx)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+
+        try:
+            self._write_xlsx(path, COLS[1:], ACC_KEYS, self.accounts)
+            QMessageBox.information(self, "Xuất xong", f"Đã xuất {len(self.accounts)} tài khoản:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Lỗi xuất file", str(e))
+
+    def _write_xlsx(self, path: str, headers: list, keys: list, rows: list):
+        def col_name(index: int):
+            name = ""
+            while index:
+                index, rem = divmod(index - 1, 26)
+                name = chr(65 + rem) + name
+            return name
+
+        def cell_xml(row_index: int, col_index: int, value):
+            ref = f"{col_name(col_index)}{row_index}"
+            text = xml_escape(str(value if value is not None else ""))
+            return f'<c r="{ref}" t="inlineStr"><is><t>{text}</t></is></c>'
+
+        sheet_rows = []
+        header_cells = "".join(cell_xml(1, i + 1, header) for i, header in enumerate(headers))
+        sheet_rows.append(f'<row r="1">{header_cells}</row>')
+
+        for row_index, acc in enumerate(rows, start=2):
+            cells = "".join(cell_xml(row_index, col_index + 1, acc.get(key, "")) for col_index, key in enumerate(keys))
+            sheet_rows.append(f'<row r="{row_index}">{cells}</row>')
+
+        last_col = col_name(len(headers))
+        dimension = f"A1:{last_col}{max(1, len(rows) + 1)}"
+        sheet_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <dimension ref="{dimension}"/>
+  <sheetViews><sheetView workbookViewId="0"/></sheetViews>
+  <sheetFormatPr defaultRowHeight="15"/>
+  <cols>{''.join(f'<col min="{i}" max="{i}" width="18" customWidth="1"/>' for i in range(1, len(headers) + 1))}</cols>
+  <sheetData>{''.join(sheet_rows)}</sheetData>
+</worksheet>'''
+
+        workbook_xml = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="Accounts" sheetId="1" r:id="rId1"/></sheets>
+</workbook>'''
+        workbook_rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>'''
+        root_rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>'''
+        content_types = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+</Types>'''
+        styles_xml = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>
+  <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+  <borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>
+  <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+  <cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs>
+</styleSheet>'''
+
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("[Content_Types].xml", content_types)
+            z.writestr("_rels/.rels", root_rels)
+            z.writestr("xl/workbook.xml", workbook_xml)
+            z.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+            z.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+            z.writestr("xl/styles.xml", styles_xml)
 
     # ── delete ─────────────────────────────────────────────────────────────────
     def delete_selected(self):

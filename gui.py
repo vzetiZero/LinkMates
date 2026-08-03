@@ -1070,14 +1070,19 @@ class DraggableTable(QTableWidget):
         if not indexes:
             item = self.currentItem()
             if item:
-                QApplication.clipboard().setText(item.text())
+                QApplication.clipboard().setText(item.data(Qt.UserRole) or item.text())
             return
         rows = {}
         for index in indexes:
             if self.isRowHidden(index.row()) or index.column() == 0:
                 continue
             item = self.item(index.row(), index.column())
-            rows.setdefault(index.row(), {})[index.column()] = item.text() if item else ""
+            widget = self.cellWidget(index.row(), index.column())
+            if isinstance(widget, QLineEdit):
+                text = widget.selectedText() or widget.text()
+            else:
+                text = (item.data(Qt.UserRole) or item.text()) if item else ""
+            rows.setdefault(index.row(), {})[index.column()] = text
         if not rows:
             return
         min_col = min(col for cols in rows.values() for col in cols)
@@ -1279,10 +1284,11 @@ class AccountsTab(QWidget):
         text = str(value if value is not None else "")
         item = self.table.item(row, col)
         if not item:
-            item = QTableWidgetItem(text)
+            item = QTableWidgetItem("")
             item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self.table.setItem(row, col, item)
-        item.setText(text)
+        item.setText("")
+        item.setData(Qt.UserRole, text)
         item.setTextAlignment((Qt.AlignCenter if center else Qt.AlignLeft) | Qt.AlignVCenter)
 
         widget = self.table.cellWidget(row, col)
@@ -1402,7 +1408,7 @@ class AccountsTab(QWidget):
             return
         item = self.table.item(row, col)
         if item:
-            QApplication.clipboard().setText(item.text())
+            QApplication.clipboard().setText(item.data(Qt.UserRole) or item.text())
 
     def _copy_row(self, row: int):
         if row < 0 or row >= self.table.rowCount():
@@ -1414,7 +1420,7 @@ class AccountsTab(QWidget):
                 values.append(widget.text())
             else:
                 item = self.table.item(row, col)
-                values.append(item.text() if item else "")
+                values.append((item.data(Qt.UserRole) or item.text()) if item else "")
         QApplication.clipboard().setText("\t".join(values))
 
     # ── proxy picker ───────────────────────────────────────────────────────────

@@ -1,7 +1,7 @@
 import imaplib, email, re, time
 from datetime import datetime, timezone
 
-def get_linksmate_code_dynamic(gmail_user, gmail_app_pass, target_hotmail, max_retries=10, delay=5):
+def get_linksmate_code_dynamic(gmail_user, gmail_app_pass, target_hotmail, max_retries=10, delay=5, not_before_utc=None):
     IMAP_SERVER = "imap.gmail.com"
     for attempt in range(max_retries):
         print(f"[*] [{datetime.now().strftime('%H:%M:%S')}] Kiểm tra lần {attempt+1}/{max_retries}...")
@@ -23,7 +23,10 @@ def get_linksmate_code_dynamic(gmail_user, gmail_app_pass, target_hotmail, max_r
                 if date_header:
                     try:
                         mail_date = email.utils.parsedate_to_datetime(date_header)
-                        if (now_utc - mail_date.astimezone(timezone.utc)).total_seconds() <= 120:
+                        mail_utc = mail_date.astimezone(timezone.utc)
+                        is_recent = (now_utc - mail_utc).total_seconds() <= 120
+                        is_after_login = not_before_utc is None or mail_utc >= not_before_utc
+                        if is_recent and is_after_login:
                             is_valid_time = True
                     except Exception:
                         pass

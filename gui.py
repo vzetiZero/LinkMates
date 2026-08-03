@@ -10,7 +10,7 @@ from PyQt5.QtWidgets import (
     QGroupBox, QScrollArea, QSizePolicy
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QMimeData
-from PyQt5.QtGui import QFont, QColor, QPalette, QIcon, QCursor, QDrag
+from PyQt5.QtGui import QFont, QColor, QPalette, QIcon, QCursor, QDrag, QKeySequence
 
 # ── paths ──────────────────────────────────────────────────────────────────────
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -197,6 +197,14 @@ QMenu::separator {
 QDialogButtonBox QPushButton {
     min-width: 80px;
 }
+QLineEdit#cellText {
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    padding: 4px 6px;
+    color: #e2e8f0;
+    selection-background-color: #2563eb;
+}
 """
 
 LIGHT_QSS = """
@@ -366,6 +374,14 @@ QMenu::separator {
 QDialogButtonBox QPushButton {
     min-width: 80px;
 }
+QLineEdit#cellText {
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    padding: 4px 6px;
+    color: #0f172a;
+    selection-background-color: #bfdbfe;
+}
 """
 
 # ── columns ────────────────────────────────────────────────────────────────────
@@ -525,6 +541,7 @@ class Worker(QThread):
 class CheckGroupWorker(QThread):
     status_update = pyqtSignal(int, str)
     groups_update = pyqtSignal(int, str)
+    info_update   = pyqtSignal(int, dict)
     log_update    = pyqtSignal(int, str, str)
     finished      = pyqtSignal(int, str)
 
@@ -540,25 +557,81 @@ class CheckGroupWorker(QThread):
         self.status_update.emit(self.row, "⏳ Check nhóm...")
         self.log_update.emit(self.row, script, "START")
         try:
-            import sys as _sys
+            import sys as _sys, io, contextlib
             _sys.path.insert(0, BASE)
-            from login import do_login, parse_groups, format_groups
+            from bs4 import BeautifulSoup
+            from login import do_login, parse_groups, format_groups, parse_account_info
 
             mail    = self.acc.get("mail", "")
             passacc = self.acc.get("passacc", "")
             gmail   = self.settings.get("GMAIL_MAIN", "")
             apppass = self.settings.get("GMAIL_APP_PASSWORD", "")
 
-            session, _, _ = do_login(mail, passacc, gmail, apppass, self.proxy, "")
+            login_log = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(login_log):
+                    session, _, _ = do_login(mail, passacc, gmail, apppass, self.proxy, "")
+            finally:
+                for line in login_log.getvalue().splitlines():
+                    line = line.strip()
+                    if line:
+                        self.log_update.emit(self.row, script, line)
+
             r = session.get("https://linksmate.jp/mypage/")
             groups = parse_groups(r.text)
             groups_text = format_groups(groups)
             if not groups_text:
                 raise Exception("Không tìm thấy nhóm trên mypage")
 
+            info = {}
+            info.update(parse_account_info(r.text))
+
+            for url in (
+                "https://linksmate.jp/mypage/userinfo/",
+                "https://linksmate.jp/mypage/userinfo/edit/",
+                "https://linksmate.jp/mypage/customer/",
+                "https://linksmate.jp/mypage/customerinfo/",
+                "https://linksmate.jp/mypage/contract/",
+                "https://linksmate.jp/mypage/member/",
+                "https://linksmate.jp/mypage/account/",
+                "https://linksmate.jp/mypage/eid/",
+            ):
+                try:
+                    rr = session.get(url)
+                    self.log_update.emit(self.row, script, f"GET {url} -> {rr.status_code} {rr.url}")
+                    if rr.status_code < 400:
+                        info.update(parse_account_info(rr.text))
+                except Exception as e:
+                    self.log_update.emit(self.row, script, f"WARN {url}: {e}")
+
+            try:
+                rr = session.get("https://linksmate.jp/mypage/simcardadd/")
+                self.log_update.emit(self.row, script, f"GET simcardadd -> {rr.status_code}")
+                if rr.status_code < 400:
+                    soup = BeautifulSoup(rr.text, "html.parser")
+                    phones = []
+                    for td in soup.select("td[data-label='SIMカード電話番号']"):
+                        div = td.select_one(".simcardadd__div-data")
+                        if div:
+                            phone = div.get_text(strip=True)
+                            if phone and phone not in phones:
+                                phones.append(phone)
+                    if phones:
+                        info["sdt"] = "\n".join(phones)
+            except Exception as e:
+                self.log_update.emit(self.row, script, f"WARN simcardadd: {e}")
+
             self.log_update.emit(self.row, script, f"GROUPS: {groups_text}")
             self.groups_update.emit(self.row, groups_text)
-            self.finished.emit(self.row, f"✅ Check nhóm: {groups_text[:60]}")
+            if info:
+                self.info_update.emit(self.row, info)
+                self.log_update.emit(self.row, script, f"INFO: {', '.join(sorted(info.keys()))}")
+            profile_keys = sorted(k for k in info.keys() if k != "lp_code")
+            if profile_keys:
+                self.finished.emit(self.row, f"✅ Check nhóm/info: {', '.join(profile_keys)[:55]}")
+            else:
+                self.log_update.emit(self.row, script, "INFO_PROFILE: chưa thấy field họ tên/địa chỉ/eid/sđt trong HTML")
+                self.finished.emit(self.row, f"✅ Check nhóm OK, chưa thấy info profile")
         except Exception as e:
             self.log_update.emit(self.row, script, f"EXCEPTION: {e}")
             self.finished.emit(self.row, f"❌ {str(e)[:80]}")
@@ -986,6 +1059,34 @@ class DraggableTable(QTableWidget):
         self.row_moved.emit(src, insert_at)
         event.accept()
 
+    def keyPressEvent(self, event):
+        if event.matches(QKeySequence.Copy):
+            self._copy_selected_cells()
+            return
+        super().keyPressEvent(event)
+
+    def _copy_selected_cells(self):
+        indexes = sorted(self.selectedIndexes(), key=lambda i: (i.row(), i.column()))
+        if not indexes:
+            item = self.currentItem()
+            if item:
+                QApplication.clipboard().setText(item.text())
+            return
+        rows = {}
+        for index in indexes:
+            if self.isRowHidden(index.row()) or index.column() == 0:
+                continue
+            item = self.item(index.row(), index.column())
+            rows.setdefault(index.row(), {})[index.column()] = item.text() if item else ""
+        if not rows:
+            return
+        min_col = min(col for cols in rows.values() for col in cols)
+        max_col = max(col for cols in rows.values() for col in cols)
+        lines = []
+        for row in sorted(rows):
+            lines.append("\t".join(rows[row].get(col, "") for col in range(min_col, max_col + 1)))
+        QApplication.clipboard().setText("\n".join(lines))
+
 # ── Accounts tab ───────────────────────────────────────────────────────────────
 class AccountsTab(QWidget):
     def __init__(self, settings_tab: SettingsTab, parent=None):
@@ -1093,7 +1194,7 @@ class AccountsTab(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.verticalHeader().setDefaultSectionSize(34)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectItems)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
@@ -1151,27 +1252,51 @@ class AccountsTab(QWidget):
         self.table.setItem(r, 0, check_item)
         for c, key in enumerate(ACC_KEYS, start=1):
             val = acc.get(key, "")
-            item = QTableWidgetItem(str(val))
-            item.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
-            if key == "status":
-                item.setTextAlignment(Qt.AlignCenter)
-            self.table.setItem(r, c, item)
+            self._set_cell_text(r, c, val, center=(key == "status"))
 
     def _update_row(self, row: int, acc: dict):
         for c, key in enumerate(ACC_KEYS, start=1):
-            item = self.table.item(row, c)
-            if item:
-                item.setText(str(acc.get(key,"")))
+            self._set_cell_text(row, c, acc.get(key, ""), center=(key == "status"))
 
     def _set_status(self, row: int, text: str):
+        self._set_cell_text(row, 1, text, center=True)
         item = self.table.item(row, 1)
         if item:
-            item.setText(text)
             color_map = {"✅":"#22c55e","❌":"#ef4444","⏳":"#f59e0b","⏰":"#f59e0b"}
+            widget = self.table.cellWidget(row, 1)
+            matched = False
             for k,v in color_map.items():
                 if text.startswith(k):
                     item.setForeground(QColor(v))
+                    if widget:
+                        widget.setStyleSheet(f"color:{v};")
+                    matched = True
                     break
+            if not matched and widget:
+                widget.setStyleSheet("")
+
+    def _set_cell_text(self, row: int, col: int, value, center=False):
+        text = str(value if value is not None else "")
+        item = self.table.item(row, col)
+        if not item:
+            item = QTableWidgetItem(text)
+            item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            self.table.setItem(row, col, item)
+        item.setText(text)
+        item.setTextAlignment((Qt.AlignCenter if center else Qt.AlignLeft) | Qt.AlignVCenter)
+
+        widget = self.table.cellWidget(row, col)
+        if not isinstance(widget, QLineEdit):
+            widget = QLineEdit()
+            widget.setObjectName("cellText")
+            widget.setReadOnly(True)
+            widget.setFrame(False)
+            widget.setContextMenuPolicy(Qt.DefaultContextMenu)
+            widget.setFocusPolicy(Qt.StrongFocus)
+            self.table.setCellWidget(row, col, widget)
+        widget.setText(text)
+        widget.setAlignment(Qt.AlignCenter if center else Qt.AlignLeft)
+        widget.setCursorPosition(0)
 
     def _on_search_changed(self):
         self.current_page = 0
@@ -1267,6 +1392,31 @@ class AccountsTab(QWidget):
         if hasattr(self, "txt_log"):
             self.txt_log.clear()
 
+    def _copy_cell_at(self, row: int, col: int):
+        if row < 0 or col <= 0:
+            return
+        widget = self.table.cellWidget(row, col)
+        if isinstance(widget, QLineEdit):
+            selected = widget.selectedText()
+            QApplication.clipboard().setText(selected or widget.text())
+            return
+        item = self.table.item(row, col)
+        if item:
+            QApplication.clipboard().setText(item.text())
+
+    def _copy_row(self, row: int):
+        if row < 0 or row >= self.table.rowCount():
+            return
+        values = []
+        for col in range(1, self.table.columnCount()):
+            widget = self.table.cellWidget(row, col)
+            if isinstance(widget, QLineEdit):
+                values.append(widget.text())
+            else:
+                item = self.table.item(row, col)
+                values.append(item.text() if item else "")
+        QApplication.clipboard().setText("\t".join(values))
+
     # ── proxy picker ───────────────────────────────────────────────────────────
     def _next_proxy(self):
         proxies = [p.strip() for p in
@@ -1291,6 +1441,7 @@ class AccountsTab(QWidget):
         worker  = Worker(script, row, acc, sett, proxy)
         worker.status_update.connect(self._set_status)
         worker.groups_update.connect(self._on_worker_groups_update)
+        worker.info_update.connect(self._on_worker_info_update)
         worker.log_update.connect(self._append_log)
         worker.finished.connect(self._on_finished)
         self.workers[row] = worker
@@ -1384,6 +1535,23 @@ class AccountsTab(QWidget):
         self._update_row(row, self.accounts[row])
         save_accounts(self.accounts)
 
+    def _on_worker_info_update(self, row: int, info: dict):
+        if row >= len(self.accounts):
+            return
+        updated = False
+        for key in ACC_KEYS:
+            value = info.get(key)
+            if value is None:
+                continue
+            value = str(value).strip()
+            if value:
+                self.accounts[row][key] = value
+                updated = True
+        if updated:
+            normalize_romaji_fields(self.accounts[row])
+            self._update_row(row, self.accounts[row])
+            save_accounts(self.accounts)
+
     def _on_finished(self, row: int, result: str):
         self._set_status(row, result)
         if row < len(self.accounts):
@@ -1445,11 +1613,7 @@ class AccountsTab(QWidget):
         check_item.setTextAlignment(Qt.AlignCenter)
         self.table.setItem(insert_at, 0, check_item)
         for c, key in enumerate(ACC_KEYS, start=1):
-            item = QTableWidgetItem(str(acc.get(key, "")))
-            item.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
-            if key == "status":
-                item.setTextAlignment(Qt.AlignCenter)
-            self.table.setItem(insert_at, c, item)
+            self._set_cell_text(insert_at, c, acc.get(key, ""), center=(key == "status"))
         save_accounts(self.accounts)
         self._apply_filter()
         self.table.scrollToItem(self.table.item(insert_at, 0))
@@ -1627,6 +1791,14 @@ class AccountsTab(QWidget):
             a_edit.triggered.connect(lambda: self._edit_row(row))
             menu.addAction(a_edit)
 
+            a_copy_cell = QAction("📋  Copy ô này", self)
+            a_copy_cell.triggered.connect(lambda: self._copy_cell_at(row, self.table.columnAt(pos.x())))
+            menu.addAction(a_copy_cell)
+
+            a_copy_row = QAction("📋  Copy dòng này", self)
+            a_copy_row.triggered.connect(lambda: self._copy_row(row))
+            menu.addAction(a_copy_row)
+
             menu.addSeparator()
             a_create = QAction("▶  Tạo tài khoản  (test1.py)", self)
             a_create.triggered.connect(lambda: self._run_row(row,"test1.py"))
@@ -1724,9 +1896,9 @@ class AccountsTab(QWidget):
                 # Lưu mã số vào data và bảng
                 self.accounts[row]["lp_code"] = code
                 lp_col = ACC_KEYS.index("lp_code") + 1
+                self._set_cell_text(row, lp_col, code)
                 item = self.table.item(row, lp_col)
                 if item:
-                    item.setText(code)
                     item.setForeground(QColor("#22c55e"))
                 save_accounts(self.accounts)
 

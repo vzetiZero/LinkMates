@@ -3,6 +3,7 @@ Hàm login LinksMate dùng chung.
 Trả về (session, csrf_name, csrf_value) hoặc raise Exception nếu thất bại.
 """
 import os, sys, re, requests
+from datetime import datetime, timezone, timedelta
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test import get_linksmate_code_dynamic
 from bs4 import BeautifulSoup
@@ -75,6 +76,109 @@ def parse_groups(html):
 def format_groups(groups):
     return " | ".join(f'{g["order"]}:{g["id"]}' for g in groups)
 
+def parse_account_info(html):
+    """Parse các thông tin account phổ biến từ HTML mypage/form nếu có."""
+    soup = BeautifulSoup(html, "html.parser")
+    info = {}
+
+    def clean_text(value):
+        return re.sub(r"\s+", " ", str(value or "").replace("\u3000", " ")).strip()
+
+    def set_if_value(key, value):
+        value = clean_text(value)
+        if value:
+            info[key] = value
+
+    def split_name(value, first_key="ho", second_key="ten"):
+        value = clean_text(value)
+        if not value:
+            return
+        parts = value.split()
+        if len(parts) >= 2:
+            set_if_value(first_key, parts[0])
+            set_if_value(second_key, " ".join(parts[1:]))
+        elif first_key not in info:
+            set_if_value(first_key, value)
+
+    def map_label_value(label, value):
+        label = clean_text(label)
+        value = clean_text(value)
+        if not label or not value:
+            return
+        upper_label = label.upper()
+        if any(k in label for k in ("氏名", "お名前", "名前", "契約者名")) and not any(k in label for k in ("カナ", "フリガナ", "ローマ")):
+            split_name(value, "ho", "ten")
+        elif any(k in label for k in ("フリガナ", "カナ")):
+            split_name(value, "hophienam", "tenphienam")
+        elif any(k in label for k in ("ローマ", "英字")) or "ROMAJI" in upper_label:
+            split_name(value, "ho1", "ten1")
+        elif any(k in label for k in ("郵便", "〒")):
+            set_if_value("mabuudien", value)
+        elif "住所" in label:
+            set_if_value("diachi", value)
+        elif "EID" in upper_label:
+            set_if_value("eid", value)
+        elif any(k in label for k in ("電話番号", "携帯電話", "連絡先電話", "SIMカード電話番号")):
+            set_if_value("sdt", value)
+
+    input_map = {
+        "familyname": "ho",
+        "firstname": "ten",
+        "familyname_romaji": "ho1",
+        "firstname_romaji": "ten1",
+        "familyname_kana": "hophienam",
+        "firstname_kana": "tenphienam",
+        "postal_code": "mabuudien",
+        "eid": "eid",
+    }
+
+    for input_name, key in input_map.items():
+        tag = soup.find(["input", "select", "textarea"], {"name": input_name})
+        if tag:
+            value = tag.get("value", "") if tag.name != "textarea" else tag.get_text(strip=True)
+            set_if_value(key, value)
+
+    address_parts = []
+    for input_name in ("prefecture", "city", "address", "address2"):
+        tag = soup.find(["input", "select", "textarea"], {"name": input_name})
+        if not tag:
+            continue
+        value = tag.get("value", "") if tag.name != "textarea" else tag.get_text(strip=True)
+        value = clean_text(value)
+        if value:
+            address_parts.append(value)
+    if address_parts:
+        info["diachi"] = " ".join(address_parts)
+
+    for dt in soup.find_all("dt"):
+        dd = dt.find_next_sibling("dd")
+        if dd:
+            map_label_value(dt.get_text(" ", strip=True), dd.get_text(" ", strip=True))
+
+    for th in soup.find_all("th"):
+        td = th.find_next_sibling("td")
+        if td:
+            map_label_value(th.get_text(" ", strip=True), td.get_text(" ", strip=True))
+
+    for td in soup.select("td[data-label]"):
+        map_label_value(td.get("data-label", ""), td.get_text(" ", strip=True))
+
+    for label in soup.find_all(["label", "span", "div"], string=True):
+        label_text = clean_text(label.get_text(" ", strip=True))
+        if not label_text or len(label_text) > 40:
+            continue
+        parent = label.parent
+        if not parent:
+            continue
+        value_text = clean_text(parent.get_text(" ", strip=True).replace(label_text, "", 1))
+        map_label_value(label_text, value_text)
+
+    lp_el = soup.select_one("#available_lp .mypage-lp__available-value")
+    if lp_el:
+        set_if_value("lp_code", lp_el.get_text(strip=True))
+
+    return info
+
 def change_group(session, group_id, csrf_name, csrf_value):
     group_id = str(group_id).strip()
     if not group_id:
@@ -118,31 +222,40 @@ def do_login(mail_addr, passacc, gmail_main, gmail_app_pass, proxy="", group_id=
     if proxies:
         session.proxies.update(proxies)
 
-    # Login
-    r = session.post('https://linksmate.jp/api/mypage/login', data={
-        'data[mail]': mail_addr,
-        'data[password]': passacc,
-    })
-    resp_text = r.text[:300]
-    print(f"[login] response: {resp_text}")
-    if '"status":false' in r.text or 'error' in r.text.lower() and 'csrf' not in r.text:
-        print(f"[login] cảnh báo: có thể sai mật khẩu")
+    cc = None
+    last_error = None
+    for login_attempt in range(2):
+        login_started = datetime.now(timezone.utc) - timedelta(seconds=5)
+        r = session.post('https://linksmate.jp/api/mypage/login', data={
+            'data[mail]': mail_addr,
+            'data[password]': passacc,
+        })
+        resp_text = r.text[:300]
+        print(f"[login] response: {resp_text}")
+        if '"status":false' in r.text or 'error' in r.text.lower() and 'csrf' not in r.text:
+            print(f"[login] cảnh báo: có thể sai mật khẩu")
 
-    # Lấy verify code từ gmail
-    code = get_linksmate_code_dynamic(gmail_main, gmail_app_pass, mail_addr)
-    if not code:
-        raise Exception("FAIL: Không lấy được code xác thực mail")
-    print(f"[login] verify code: {code}")
+        code = get_linksmate_code_dynamic(gmail_main, gmail_app_pass, mail_addr, not_before_utc=login_started)
+        if not code:
+            raise Exception("FAIL: Không lấy được code xác thực mail")
+        print(f"[login] verify code: {code}")
 
-    # Xác thực email
-    r2 = session.post('https://linksmate.jp/email_verification/', data={'verify_code': code})
-    print(f"[login] verify url: {r2.url}")
+        r2 = session.post('https://linksmate.jp/email_verification/', data={'verify_code': code})
+        print(f"[login] verify url: {r2.url}")
 
-    # Lấy csrf từ mypage. Mặc định LinksMate trả về group đầu tiên.
-    cc = session.get("https://linksmate.jp/mypage/")
-    print(f"[login] mypage url: {cc.url}")
-
-    csrf_name, csrf_value = parse_csrf(cc.text)
+        cc = session.get("https://linksmate.jp/mypage/")
+        print(f"[login] mypage url: {cc.url}")
+        try:
+            csrf_name, csrf_value = parse_csrf(cc.text)
+            break
+        except Exception as e:
+            last_error = e
+            if "login" in cc.url and login_attempt == 0:
+                print("[login] verify chưa vào được mypage, thử lấy OTP mới lần 2")
+                continue
+            raise
+    else:
+        raise last_error or Exception("FAIL: Login không vào được mypage")
 
     groups = parse_groups(cc.text)
     print(f"[login] groups found: {format_groups(groups) if groups else 'none'}")

@@ -1,7 +1,7 @@
 import imaplib, email, re, time
 from datetime import datetime, timezone
 
-def get_linksmate_code_dynamic(gmail_user, gmail_app_pass, target_hotmail, max_retries=10, delay=5, not_before_utc=None):
+def get_linksmate_code_dynamic(gmail_user, gmail_app_pass, target_hotmail, max_retries=5, delay=5, not_before_utc=None):
     IMAP_SERVER = "imap.gmail.com"
     for attempt in range(max_retries):
         print(f"[*] [{datetime.now().strftime('%H:%M:%S')}] Kiểm tra lần {attempt+1}/{max_retries}...")

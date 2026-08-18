@@ -106,19 +106,26 @@ def parse_account_info(html):
         if not label or not value:
             return
         upper_label = label.upper()
-        if any(k in label for k in ("氏名", "お名前", "名前", "契約者名")) and not any(k in label for k in ("カナ", "フリガナ", "ローマ")):
+        if (any(k in label for k in ("氏名", "お名前", "名前", "契約者名"))
+                or "TÊN NGƯỜI ĐỨNG TÊN HỢP ĐỒNG" in upper_label) \
+                and not any(k in label for k in ("カナ", "フリガナ", "ローマ")):
             split_name(value, "ho", "ten")
-        elif any(k in label for k in ("フリガナ", "カナ")):
+        elif any(k in label for k in ("フリガナ", "カナ")) or "CÁCH PHÁT ÂM" in upper_label:
             split_name(value, "hophienam", "tenphienam")
-        elif any(k in label for k in ("ローマ", "英字")) or "ROMAJI" in upper_label:
+        elif (any(k in label for k in ("ローマ", "英字")) or "ROMAJI" in upper_label
+              or "LA MÃ" in upper_label or "LATIN" in upper_label):
             split_name(value, "ho1", "ten1")
-        elif any(k in label for k in ("郵便", "〒")):
+        elif any(k in label for k in ("郵便", "〒")) or "MÃ BƯU ĐIỆN" in upper_label:
             set_if_value("mabuudien", value)
-        elif "住所" in label:
+        elif "住所" in label or "ĐỊA CHỈ" in upper_label:
             set_if_value("diachi", value)
+            zip_match = re.search(r"\b\d{7}\b", value)
+            if zip_match:
+                set_if_value("mabuudien", zip_match.group(0))
         elif "EID" in upper_label:
             set_if_value("eid", value)
-        elif any(k in label for k in ("電話番号", "携帯電話", "連絡先電話", "SIMカード電話番号")):
+        elif (any(k in label for k in ("電話番号", "携帯電話", "連絡先電話", "SIMカード電話番号"))
+              or "SỐ ĐIỆN THOẠI" in upper_label):
             set_if_value("sdt", value)
 
     input_map = {
@@ -136,6 +143,31 @@ def parse_account_info(html):
         tag = soup.find(["input", "select", "textarea"], {"name": input_name})
         if tag:
             value = tag.get("value", "") if tag.name != "textarea" else tag.get_text(strip=True)
+            set_if_value(key, value)
+
+    # Các trang hồ sơ có thể dùng family_name/first_name hoặc name lồng nhau
+    # thay vì đúng các tên field ở form đăng ký. Chuẩn hóa để đọc được cả hai.
+    input_aliases = {
+        "familyname": "ho",
+        "firstname": "ten",
+        "familynamekana": "hophienam",
+        "firstnamekana": "tenphienam",
+        "familynameromaji": "ho1",
+        "firstnameromaji": "ten1",
+        "postalcode": "mabuudien",
+        "postcode": "mabuudien",
+    }
+    for tag in soup.find_all(["input", "select", "textarea"]):
+        raw_name = " ".join(str(tag.get(attr, "")) for attr in ("name", "id", "data-name"))
+        normalized_name = re.sub(r"[^a-z0-9]", "", raw_name.lower())
+        if not normalized_name:
+            continue
+        key = next((mapped_key for alias, mapped_key in input_aliases.items()
+                    if normalized_name.endswith(alias)), None)
+        if not key:
+            continue
+        value = tag.get("value", "") if tag.name != "textarea" else tag.get_text(strip=True)
+        if value and key not in info:
             set_if_value(key, value)
 
     address_parts = []
@@ -163,6 +195,20 @@ def parse_account_info(html):
     for td in soup.select("td[data-label]"):
         map_label_value(td.get("data-label", ""), td.get_text(" ", strip=True))
 
+    # Trang registrationinfo hiển thị label/value bằng thẻ <p> lồng nhau,
+    # nên không thể đọc bằng cặp dt/dd hoặc th/td thông thường.
+    for row in soup.select(
+        ".mypage-registrationinfo__group-row, "
+        ".mypage-registrationinfo__group-row-other"
+    ):
+        label_el = row.select_one(".mypage-registrationinfo__group-row-name")
+        value_el = row.select_one(".mypage-registrationinfo__group-row-value")
+        if label_el and value_el:
+            map_label_value(
+                label_el.get_text(" ", strip=True),
+                value_el.get_text(" ", strip=True)
+            )
+
     for label in soup.find_all(["label", "span", "div"], string=True):
         label_text = clean_text(label.get_text(" ", strip=True))
         if not label_text or len(label_text) > 40:
@@ -175,14 +221,15 @@ def parse_account_info(html):
 
     lp_el = soup.select_one("#available_lp .mypage-lp__available-value")
     if lp_el:
-        set_if_value("lp_code", lp_el.get_text(strip=True))
+        # Số dư LinksPoint khác với mã LP 6 chữ số được tạo khi charge.
+        set_if_value("lp_balance", lp_el.get_text(strip=True))
 
     return info
 
-def change_group(session, group_id, csrf_name, csrf_value):
+def change_group(session, group_id, csrf_name, csrf_value, return_page=False):
     group_id = str(group_id).strip()
     if not group_id:
-        return csrf_name, csrf_value
+        return (csrf_name, csrf_value, None) if return_page else (csrf_name, csrf_value)
 
     r = session.post("https://linksmate.jp/mypage/group_change/", data={
         "csrf_name": csrf_name,
@@ -198,9 +245,12 @@ def change_group(session, group_id, csrf_name, csrf_value):
 
     cc = session.get("https://linksmate.jp/mypage/")
     print(f"[login] mypage after group_change: {cc.url}")
-    return parse_csrf(cc.text)
+    next_csrf_name, next_csrf_value = parse_csrf(cc.text)
+    if return_page:
+        return next_csrf_name, next_csrf_value, cc
+    return next_csrf_name, next_csrf_value
 
-def do_login(mail_addr, passacc, gmail_main, gmail_app_pass, proxy="", group_id=None):
+def do_login(mail_addr, passacc, gmail_main, gmail_app_pass, proxy="", group_id=None, return_page=False):
     if not mail_addr:
         raise Exception("FAIL: Chưa nhập email tài khoản")
     if not passacc:
@@ -267,4 +317,6 @@ def do_login(mail_addr, passacc, gmail_main, gmail_app_pass, proxy="", group_id=
             raise Exception(f"FAIL: Không tìm thấy group_id {group_id} trong tài khoản này")
         csrf_name, csrf_value = change_group(session, group_id, csrf_name, csrf_value)
 
+    if return_page:
+        return session, csrf_name, csrf_value, cc
     return session, csrf_name, csrf_value

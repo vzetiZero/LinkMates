@@ -17,6 +17,7 @@ from group_check_detail_dialog import GroupCheckDetailDialog
 BASE = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(BASE, "settings.json")
 ACCOUNTS_FILE = os.path.join(BASE, "accounts.json")
+APP_VERSION = "1.1.0"
 
 # ── default settings ───────────────────────────────────────────────────────────
 DEFAULT_SETTINGS = {
@@ -397,13 +398,13 @@ QLineEdit#cellText {
 
 # ── columns ────────────────────────────────────────────────────────────────────
 COLS = ["Trạng thái","Email","Group ID","Groups",
-        "SĐT Nhóm 1","SĐT Nhóm 2","SĐT  Nhóm 3","LP",
+        "SĐT Nhóm 1","SĐT Nhóm 2","SĐT  Nhóm 3",
         "Họ","Tên","Họ 1","Tên 1","Họ phiên âm","Tên phiên âm",
-        "Mã bưu điện","Địa chỉ","EID","Mã số LP","Số điện thoại"]
+        "Mã bưu điện","Địa chỉ","EID","LP khả dụng","Mã số LP (6 ký tự)","Số điện thoại"]
 ACC_KEYS = ["status","mail","group_id","groups",
-            "group1","group2","group3","lp1",
+            "group1","group2","group3",
             "ho","ten","ho1","ten1","hophienam","tenphienam",
-            "mabuudien","diachi","eid","lp_code","sdt"]
+            "mabuudien","diachi","eid","lp_balance","lp_code","sdt"]
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 def load_settings():
@@ -426,14 +427,36 @@ def load_accounts():
     if os.path.exists(ACCOUNTS_FILE):
         try:
             with open(ACCOUNTS_FILE, encoding="utf-8") as f:
-                return json.load(f)
+                accounts = json.load(f)
+            return [normalize_account_schema(acc) for acc in accounts]
         except Exception:
             pass
     return []
 
 def save_accounts(accs):
+    accs = [normalize_account_schema(acc) for acc in accs]
     with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
         json.dump(accs, f, ensure_ascii=False, indent=2)
+
+def normalize_account_schema(acc: dict) -> dict:
+    """Tách số dư LP và mã LP 6 chữ số, đồng thời migrate dữ liệu cũ."""
+    acc = dict(acc)
+    lp_code = str(acc.get("lp_code", "")).strip()
+    lp_balance = str(acc.get("lp_balance", "")).strip()
+
+    # Bản cũ từng ghi nhầm số dư dạng "8,820LP" vào lp_code.
+    if "LP" in lp_code.upper():
+        if not lp_balance:
+            lp_balance = lp_code
+        acc["lp_code"] = ""
+    elif not lp_balance:
+        # lp1 là số dư của nhóm 1 ở schema cũ; giữ lại làm giá trị khởi tạo.
+        lp_balance = str(acc.get("lp1", "")).strip()
+
+    acc["lp_balance"] = lp_balance
+    for key in ACC_KEYS:
+        acc.setdefault(key, "")
+    return acc
 
 def empty_acc():
     return {k: "" for k in ACC_KEYS}
@@ -575,7 +598,7 @@ class CheckGroupWorker(QThread):
             import sys as _sys, io, contextlib
             _sys.path.insert(0, BASE)
             from bs4 import BeautifulSoup
-            from login import do_login, parse_groups, format_groups, parse_account_info
+            from login import do_login, change_group, parse_groups, format_groups, parse_account_info
 
             mail    = self.acc.get("mail", "")
             passacc = self.acc.get("passacc", "")
@@ -585,24 +608,46 @@ class CheckGroupWorker(QThread):
             login_log = io.StringIO()
             try:
                 with contextlib.redirect_stdout(login_log):
-                    session, _, _ = do_login(mail, passacc, gmail, apppass, self.proxy, "")
+                    session, csrf_name, csrf_value, mypage_response = do_login(
+                        mail, passacc, gmail, apppass, self.proxy, "", return_page=True
+                    )
             finally:
                 for line in login_log.getvalue().splitlines():
                     line = line.strip()
                     if line:
                         self.log_update.emit(self.row, script, line)
 
-            r = session.get("https://linksmate.jp/mypage/")
-            groups = parse_groups(r.text)
+            groups = parse_groups(mypage_response.text)
             groups_text = format_groups(groups)
             if not groups_text:
                 raise Exception("Không tìm thấy nhóm trên mypage")
 
             info = {}
-            info.update(parse_account_info(r.text))
+            info.update(parse_account_info(mypage_response.text))
 
-            # Chỉ giữ lại các endpoint quan trọng cho check LP + SĐT của tài khoản.
-            # Các endpoint profile phụ không còn được gọi nữa để giảm request và tránh rác dữ liệu.
+            # /mypage/ chỉ có tổng quan, thường không chứa đủ họ/tên/kana/romaji.
+            # Chỉ đọc trang thông tin đăng ký để lấy dữ liệu người dùng.
+            profile_pages = [
+                ("registrationinfo", "https://linksmate.jp/mypage/registrationinfo/"),
+            ]
+            for page_name, page_url in profile_pages:
+                try:
+                    profile_response = session.get(page_url)
+                    self.log_update.emit(
+                        self.row, script,
+                        f"GET {page_name} -> {profile_response.status_code}"
+                    )
+                    if profile_response.status_code >= 400 or "login" in profile_response.url:
+                        continue
+                    profile_info = parse_account_info(profile_response.text)
+                    info.update(profile_info)
+                    if profile_info:
+                        self.log_update.emit(
+                            self.row, script,
+                            f"INFO {page_name}: {', '.join(sorted(profile_info.keys()))}"
+                        )
+                except Exception as e:
+                    self.log_update.emit(self.row, script, f"WARN {page_name}: {e}")
 
             group_details = []
             for group in groups:
@@ -610,13 +655,14 @@ class CheckGroupWorker(QThread):
                 group_id = str(group.get("id", "")).strip()
                 label = str(group.get("label", "")).strip()
                 try:
-                    group_session, _, _ = do_login(mail, passacc, gmail, apppass, self.proxy, group_id)
-                    rr = group_session.get("https://linksmate.jp/mypage/")
-                    soup = BeautifulSoup(rr.text, "html.parser")
+                    csrf_name, csrf_value, group_page = change_group(
+                        session, group_id, csrf_name, csrf_value, return_page=True
+                    )
+                    soup = BeautifulSoup(group_page.text, "html.parser")
                     lp_el = soup.select_one("#available_lp .mypage-lp__available-value")
                     lp_text = lp_el.get_text(strip=True) if lp_el else "N/A"
 
-                    rr2 = group_session.get("https://linksmate.jp/mypage/simcardadd/")
+                    rr2 = session.get("https://linksmate.jp/mypage/simcardadd/")
                     phones = []
                     if rr2.status_code < 400:
                         soup2 = BeautifulSoup(rr2.text, "html.parser")
@@ -658,23 +704,6 @@ class CheckGroupWorker(QThread):
                     info[f"lp{order}"] = lp
                     info[f"group{order}_id"] = group_id
                 self.group_details_update.emit(self.row, group_details)
-
-            try:
-                rr = session.get("https://linksmate.jp/mypage/simcardadd/")
-                self.log_update.emit(self.row, script, f"GET simcardadd -> {rr.status_code}")
-                if rr.status_code < 400:
-                    soup = BeautifulSoup(rr.text, "html.parser")
-                    phones = []
-                    for td in soup.select("td[data-label='SIMカード電話番号']"):
-                        div = td.select_one(".simcardadd__div-data")
-                        if div:
-                            phone = div.get_text(strip=True)
-                            if phone and phone not in phones:
-                                phones.append(phone)
-                    if phones and "sdt" not in info:
-                        info["sdt"] = "\n".join(phones)
-            except Exception as e:
-                self.log_update.emit(self.row, script, f"WARN simcardadd: {e}")
 
             self.log_update.emit(self.row, script, f"GROUPS: {groups_text}")
             self.groups_update.emit(self.row, groups_text)
@@ -814,6 +843,130 @@ class SettingsTab(QWidget):
 
     def get_settings(self):
         return self.settings
+
+# ── GetCode tab ───────────────────────────────────────────────────────────────
+class GetCodeWorker(QThread):
+    """Đọc OTP LinksMate từ Gmail mà không làm treo giao diện."""
+    code_found = pyqtSignal(str)
+    error      = pyqtSignal(str)
+
+    def __init__(self, settings: dict, target_mail: str):
+        super().__init__()
+        self.settings = settings
+        self.target_mail = target_mail
+
+    def run(self):
+        try:
+            from test import get_linksmate_code_dynamic
+
+            gmail = self.settings.get("GMAIL_MAIN", "").strip()
+            app_password = self.settings.get("GMAIL_APP_PASSWORD", "").strip()
+            if not gmail or not app_password:
+                raise ValueError("Hãy nhập Gmail chính và App Password trong tab Cài đặt.")
+
+            code = get_linksmate_code_dynamic(gmail, app_password, self.target_mail)
+            if not code:
+                raise RuntimeError("Không tìm thấy code mới cho email này.")
+            self.code_found.emit(code)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class GetCodeTab(QWidget):
+    """Màn hình đọc mã xác thực thủ công cho một email LinksMate."""
+    def __init__(self, settings_tab: SettingsTab, parent=None):
+        super().__init__(parent)
+        self.settings_tab = settings_tab
+        self.worker = None
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(28, 28, 28, 28)
+        layout.setSpacing(14)
+
+        title = QLabel("Lấy code xác thực LinksMate")
+        title.setStyleSheet("color:#60a5fa;font-size:20px;font-weight:700;")
+        layout.addWidget(title)
+
+        note = QLabel("Nhập email nhận OTP. Hệ thống sẽ kiểm tra Gmail chính đã cấu hình trong tab Cài đặt.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        form = QGroupBox("Thông tin lấy code")
+        form_layout = QFormLayout(form)
+        form_layout.setSpacing(10)
+        self.e_mail = QLineEdit()
+        self.e_mail.setPlaceholderText("example@email.com")
+        self.e_mail.returnPressed.connect(self.get_code)
+        form_layout.addRow(QLabel("Email cần lấy code"), self.e_mail)
+        layout.addWidget(form)
+
+        actions = QHBoxLayout()
+        self.btn_send = QPushButton("📨  Send")
+        self.btn_send.setObjectName("btnSuccess")
+        self.btn_send.clicked.connect(self.get_code)
+        actions.addWidget(self.btn_send)
+        actions.addStretch()
+        layout.addLayout(actions)
+
+        result = QGroupBox("Code nhận được")
+        result_layout = QHBoxLayout(result)
+        self.lbl_code = QLabel("—")
+        self.lbl_code.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.lbl_code.setStyleSheet("color:#22c55e;font-size:24px;font-weight:700;padding:8px;")
+        result_layout.addWidget(self.lbl_code, 1)
+        self.btn_copy = QPushButton("📋  Copy")
+        self.btn_copy.setEnabled(False)
+        self.btn_copy.clicked.connect(self.copy_code)
+        result_layout.addWidget(self.btn_copy)
+        layout.addWidget(result)
+
+        self.lbl_status = QLabel("Sẵn sàng")
+        layout.addWidget(self.lbl_status)
+        layout.addStretch()
+
+    def get_code(self):
+        target_mail = self.e_mail.text().strip()
+        if not target_mail or "@" not in target_mail:
+            QMessageBox.warning(self, "Email không hợp lệ", "Vui lòng nhập email cần lấy code.")
+            return
+        if self.worker and self.worker.isRunning():
+            return
+
+        self.lbl_code.setText("—")
+        self.btn_copy.setEnabled(False)
+        self.btn_send.setEnabled(False)
+        self.btn_send.setText("⏳  Đang lấy code...")
+        self.lbl_status.setText("Đang kiểm tra Inbox Gmail (tối đa khoảng 25 giây)...")
+        self.lbl_status.setStyleSheet("color:#f59e0b;font-weight:600;")
+
+        self.worker = GetCodeWorker(self.settings_tab.get_settings(), target_mail)
+        self.worker.code_found.connect(self._show_code)
+        self.worker.error.connect(self._show_error)
+        self.worker.finished.connect(self._finished)
+        self.worker.start()
+
+    def _show_code(self, code: str):
+        self.lbl_code.setText(code)
+        self.btn_copy.setEnabled(True)
+        self.lbl_status.setText("Đã lấy được code.")
+        self.lbl_status.setStyleSheet("color:#22c55e;font-weight:600;")
+
+    def _show_error(self, message: str):
+        self.lbl_status.setText(f"Không thể lấy code: {message}")
+        self.lbl_status.setStyleSheet("color:#ef4444;font-weight:600;")
+
+    def _finished(self):
+        self.btn_send.setEnabled(True)
+        self.btn_send.setText("📨  Send")
+
+    def copy_code(self):
+        code = self.lbl_code.text().strip()
+        if code and code != "—":
+            QApplication.clipboard().setText(code)
+            self.lbl_status.setText("Đã copy code vào clipboard.")
+            self.lbl_status.setStyleSheet("color:#22c55e;font-weight:600;")
 
 # ── LP Info Worker ─────────────────────────────────────────────────────────────
 class LPInfoWorker(QThread):
@@ -1097,8 +1250,11 @@ class DraggableTable(QTableWidget):
         self.setDragDropOverwriteMode(False)
         self.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.setMouseTracking(True)
-        self.viewport().setMouseTracking(True)
+        # Không tự cuộn khi rê chuột/kéo dòng sát mép bảng.
+        # Thanh cuộn vẫn chỉ di chuyển khi người dùng kéo trực tiếp.
+        self.setAutoScroll(False)
+        self.setMouseTracking(False)
+        self.viewport().setMouseTracking(False)
         self._drag_source_row = -1
 
     def mousePressEvent(self, event):
@@ -1170,9 +1326,11 @@ class AccountsTab(QWidget):
         btn_xoa = QPushButton("📵  Xóa số")
         btn_xoa.setObjectName("btnDanger")
         btn_xoa.clicked.connect(lambda: self._run_selected("xoaso.py","⏳ Xóa số"))
+        self.btn_toggle_log = QPushButton("📜  Mở Log")
+        self.btn_toggle_log.clicked.connect(self._toggle_log_panel)
 
         # Add buttons to toolbar
-        for b in [btn_add, btn_add_empty, btn_insert, btn_del, btn_export, self.btn_create_acc, self.btn_task3, btn_xoa]:
+        for b in [btn_add, btn_add_empty, btn_insert, btn_del, btn_export, self.btn_create_acc, self.btn_task3, btn_xoa, self.btn_toggle_log]:
             toolbar.addWidget(b)
         toolbar.addStretch()
 
@@ -1236,7 +1394,7 @@ class AccountsTab(QWidget):
         self.table.customContextMenuRequested.connect(self._context_menu)
         self.table.row_moved.connect(self._move_row)
         # col widths
-        widths = [120,200,110,90,220,220,220,90,80,80,80,80,110,110,100,160,200,120,140]
+        widths = [120,200,110,90,220,220,220,80,80,80,80,110,110,100,160,200,120,120,140]
         for i,w in enumerate(widths):
             self.table.setColumnWidth(i, w)
 
@@ -1250,9 +1408,9 @@ class AccountsTab(QWidget):
         lbl_log.setStyleSheet("color:#60a5fa;font-weight:700;")
         log_toolbar.addWidget(lbl_log)
         log_toolbar.addStretch()
-        self.btn_toggle_log = QPushButton("Thu gọn")
-        self.btn_toggle_log.clicked.connect(self._toggle_log_panel)
-        log_toolbar.addWidget(self.btn_toggle_log)
+        self.btn_collapse_log = QPushButton("Thu gọn")
+        self.btn_collapse_log.clicked.connect(self._toggle_log_panel)
+        log_toolbar.addWidget(self.btn_collapse_log)
         btn_clear_log = QPushButton("Clear Log")
         btn_clear_log.clicked.connect(self._clear_log)
         log_toolbar.addWidget(btn_clear_log)
@@ -1272,6 +1430,7 @@ class AccountsTab(QWidget):
         self.splitter.setCollapsible(1, True)
         self.splitter.setSizes([900, 360])
         layout.addWidget(self.splitter, 1)
+        self._set_log_panel_visible(False)
 
     # ── table helpers ──────────────────────────────────────────────────────────
     def _load_table(self):
@@ -1292,8 +1451,9 @@ class AccountsTab(QWidget):
             self._set_cell_text(row, c, acc.get(key, ""), center=(key == "status"))
 
     def _set_status(self, row: int, text: str):
-        self._set_cell_text(row, 1, text, center=True)
-        item = self.table.item(row, 1)
+        status_col = ACC_KEYS.index("status")
+        self._set_cell_text(row, status_col, text, center=True)
+        item = self.table.item(row, status_col)
         if item:
             color_map = {"✅":"#22c55e","❌":"#ef4444","⏳":"#f59e0b","⏰":"#f59e0b"}
             widget = self.table.cellWidget(row, 1)
@@ -1414,18 +1574,23 @@ class AccountsTab(QWidget):
             self.txt_log.clear()
 
     def _toggle_log_panel(self):
-        if not hasattr(self, "right_panel") or not hasattr(self, "btn_toggle_log"):
+        if not hasattr(self, "right_panel"):
             return
-        if self.right_panel.isVisible():
-            self.right_panel.hide()
-            self.btn_toggle_log.setText("Mở")
-            if hasattr(self, "splitter"):
-                self.splitter.setSizes([self.splitter.width(), 0])
-        else:
+        self._set_log_panel_visible(not self.right_panel.isVisible())
+
+    def _set_log_panel_visible(self, visible: bool):
+        if visible:
             self.right_panel.show()
-            self.btn_toggle_log.setText("Thu gọn")
+            self.btn_toggle_log.setText("📜  Thu gọn Log")
+            if hasattr(self, "btn_collapse_log"):
+                self.btn_collapse_log.setText("Thu gọn")
             if hasattr(self, "splitter"):
                 self.splitter.setSizes([900, 360])
+        else:
+            self.right_panel.hide()
+            self.btn_toggle_log.setText("📜  Mở Log")
+            if hasattr(self, "splitter"):
+                self.splitter.setSizes([self.splitter.width(), 0])
 
     def _copy_cell_at(self, row: int, col: int):
         if row < 0 or col <= 0:
@@ -1936,7 +2101,7 @@ class AccountsTab(QWidget):
                 dlg.set_result(code)
                 # Lưu mã số vào data và bảng
                 self.accounts[row]["lp_code"] = code
-                lp_col = ACC_KEYS.index("lp_code") + 1
+                lp_col = ACC_KEYS.index("lp_code")
                 self._set_cell_text(row, lp_col, code)
                 item = self.table.item(row, lp_col)
                 if item:
@@ -1955,13 +2120,15 @@ class AccountsTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("AutoLinksMate  v1.0")
+        self.setWindowTitle(f"AutoLinksMate  v{APP_VERSION}")
         self.setMinimumSize(1200, 680)
         tabs = QTabWidget()
         self.settings_tab  = SettingsTab()
         self.settings = self.settings_tab.settings
         self.accounts_tab  = AccountsTab(self.settings_tab)
+        self.get_code_tab  = GetCodeTab(self.settings_tab)
         tabs.addTab(self.accounts_tab, "📋  Tài khoản & Chạy")
+        tabs.addTab(self.get_code_tab, "📨  GetCode")
         tabs.addTab(self.settings_tab, "⚙️  Cài đặt")
         self.setCentralWidget(tabs)
 

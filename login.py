@@ -284,6 +284,7 @@ def do_login(mail_addr, passacc, gmail_main, gmail_app_pass, proxy="", group_id=
         print(f"[login] response: {resp_text}")
         if '"status":false' in r.text or 'error' in r.text.lower() and 'csrf' not in r.text:
             print(f"[login] cảnh báo: có thể sai mật khẩu")
+            raise Exception("FAIL: Sai mật khẩu hoặc tài khoản không login được")
 
         code = get_linksmate_code_dynamic(gmail_main, gmail_app_pass, mail_addr, not_before_utc=login_started)
         if not code:

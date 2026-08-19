@@ -17,7 +17,8 @@ from group_check_detail_dialog import GroupCheckDetailDialog
 BASE = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(BASE, "settings.json")
 ACCOUNTS_FILE = os.path.join(BASE, "accounts.json")
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.3.0"
+DEAD_LOGIN_THRESHOLD = 2
 
 # ── default settings ───────────────────────────────────────────────────────────
 DEFAULT_SETTINGS = {
@@ -397,26 +398,29 @@ QLineEdit#cellText {
 """
 
 # ── columns ────────────────────────────────────────────────────────────────────
-COLS = ["Trạng thái","Email","Group ID","Groups",
+COLS = ["Trạng thái","Email","LP khả dụng","Group ID","Groups",
         "SĐT Nhóm 1","SĐT Nhóm 2","SĐT  Nhóm 3",
         "Họ","Tên","Họ 1","Tên 1","Họ phiên âm","Tên phiên âm",
-        "Mã bưu điện","Địa chỉ","EID","LP khả dụng","Mã số LP (6 ký tự)","Số điện thoại"]
-ACC_KEYS = ["status","mail","group_id","groups",
+        "Mã bưu điện","Địa chỉ","EID","Mã số LP (6 ký tự)","Số điện thoại"]
+ACC_KEYS = ["status","mail","lp_balance","group_id","groups",
             "group1","group2","group3",
             "ho","ten","ho1","ten1","hophienam","tenphienam",
-            "mabuudien","diachi","eid","lp_balance","lp_code","sdt"]
+            "mabuudien","diachi","eid","lp_code","sdt"]
+DIE_KEYS = ["is_dead", "dead_reason", "dead_at", "dead_source", "dead_count", "last_error"]
+DEAD_COLS = ["Email", "Trạng thái", "Lý do DIE", "Thời điểm", "Nguồn", "Số lần lỗi", "Lỗi gần nhất", "Group ID", "Groups"]
+DEAD_KEYS = ["mail", "status", "dead_reason", "dead_at", "dead_source", "dead_count", "last_error", "group_id", "groups"]
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 def load_settings():
     if os.path.exists(SETTINGS_FILE):
         try:
-            with open(SETTINGS_FILE, encoding="utf-8") as f:
+            with open(SETTINGS_FILE, encoding="utf-8-sig") as f:
                 d = json.load(f)
             s = dict(DEFAULT_SETTINGS)
             s.update(d)
             return s
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[settings] Không đọc được settings.json: {e}")
     return dict(DEFAULT_SETTINGS)
 
 def save_settings(s):
@@ -426,11 +430,11 @@ def save_settings(s):
 def load_accounts():
     if os.path.exists(ACCOUNTS_FILE):
         try:
-            with open(ACCOUNTS_FILE, encoding="utf-8") as f:
+            with open(ACCOUNTS_FILE, encoding="utf-8-sig") as f:
                 accounts = json.load(f)
             return [normalize_account_schema(acc) for acc in accounts]
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[accounts] Không đọc được accounts.json: {e}")
     return []
 
 def save_accounts(accs):
@@ -456,10 +460,61 @@ def normalize_account_schema(acc: dict) -> dict:
     acc["lp_balance"] = lp_balance
     for key in ACC_KEYS:
         acc.setdefault(key, "")
+    for key in DIE_KEYS:
+        acc.setdefault(key, False if key == "is_dead" else "")
+    acc["is_dead"] = bool(acc.get("is_dead"))
+    try:
+        acc["dead_count"] = int(acc.get("dead_count") or 0)
+    except (TypeError, ValueError):
+        acc["dead_count"] = 0
     return acc
 
 def empty_acc():
-    return {k: "" for k in ACC_KEYS}
+    acc = {k: "" for k in ACC_KEYS}
+    for key in DIE_KEYS:
+        acc[key] = False if key == "is_dead" else ""
+    acc["dead_count"] = 0
+    return acc
+
+def is_temporary_login_error(message: str) -> bool:
+    text = str(message or "").lower()
+    temporary_keywords = [
+        "không lấy được code",
+        "code xác thực",
+        "timeout",
+        "proxy",
+        "connection",
+        "connect",
+        "network",
+        "read timed out",
+        "temporarily",
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+    ]
+    return any(k in text for k in temporary_keywords)
+
+def is_dead_login_error(message: str) -> bool:
+    text = str(message or "").lower()
+    if is_temporary_login_error(text):
+        return False
+    dead_keywords = [
+        "sai mật khẩu",
+        "invalid password",
+        "incorrect password",
+        "wrong password",
+        "login không vào được mypage",
+        "không vào được mypage",
+        "account locked",
+        "locked",
+        "suspended",
+        "disabled",
+        "unauthorized",
+        "authentication failed",
+        "đăng nhập thất bại",
+    ]
+    return any(k in text for k in dead_keywords)
 
 def fullwidth_to_ascii_upper(text: str) -> str:
     """Chuyển fullwidth (ｃＨＩＣｏＮｇ) hoặc có dấu tiếng Việt → ASCII HOA không dấu."""
@@ -1237,8 +1292,30 @@ class LPChargeDialog(QDialog):
         self.btn_ok.setEnabled(True)
 
 
-# ── Draggable Table ────────────────────────────────────────────────────────────
-class DraggableTable(QTableWidget):
+# ── Table helpers ──────────────────────────────────────────────────────────────
+class HoverTable(QTableWidget):
+    hover_row_changed = pyqtSignal(int)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
+        self._hover_row = -1
+
+    def mouseMoveEvent(self, event):
+        row = self.rowAt(event.pos().y())
+        if row != self._hover_row:
+            self._hover_row = row
+            self.hover_row_changed.emit(row)
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        if self._hover_row != -1:
+            self._hover_row = -1
+            self.hover_row_changed.emit(-1)
+        super().leaveEvent(event)
+
+class DraggableTable(HoverTable):
     row_moved = pyqtSignal(int, int)  # from_row, to_row
 
     def __init__(self, *args, **kwargs):
@@ -1253,8 +1330,6 @@ class DraggableTable(QTableWidget):
         # Không tự cuộn khi rê chuột/kéo dòng sát mép bảng.
         # Thanh cuộn vẫn chỉ di chuyển khi người dùng kéo trực tiếp.
         self.setAutoScroll(False)
-        self.setMouseTracking(False)
-        self.viewport().setMouseTracking(False)
         self._drag_source_row = -1
 
     def mousePressEvent(self, event):
@@ -1279,12 +1354,15 @@ class DraggableTable(QTableWidget):
 
 # ── Accounts tab ───────────────────────────────────────────────────────────────
 class AccountsTab(QWidget):
+    dead_accounts_changed = pyqtSignal()
+
     def __init__(self, settings_tab: SettingsTab, parent=None):
         super().__init__(parent)
         self.settings_tab = settings_tab
         self.accounts     = load_accounts()
         self.workers      = {}   # row -> Worker
         self._proxy_index = 0
+        self._hover_row = -1
         self.page_size    = 60
         self.current_page = 0
         self.filtered_rows = []
@@ -1312,6 +1390,11 @@ class AccountsTab(QWidget):
         btn_del.clicked.connect(self.delete_selected)
         btn_export = QPushButton("📤  Xuất Excel")
         btn_export.clicked.connect(self.export_excel)
+        btn_mark_dead = QPushButton("☠  Đánh dấu DIE")
+        btn_mark_dead.setObjectName("btnDanger")
+        btn_mark_dead.clicked.connect(self.mark_selected_dead)
+        btn_restore_dead = QPushButton("♻  Khôi phục")
+        btn_restore_dead.clicked.connect(self.restore_selected_dead)
 
         # Sequential workflow buttons
         self.btn_create_acc = QPushButton("▶  Tạo tài khoản")
@@ -1330,7 +1413,7 @@ class AccountsTab(QWidget):
         self.btn_toggle_log.clicked.connect(self._toggle_log_panel)
 
         # Add buttons to toolbar
-        for b in [btn_add, btn_add_empty, btn_insert, btn_del, btn_export, self.btn_create_acc, self.btn_task3, btn_xoa, self.btn_toggle_log]:
+        for b in [btn_add, btn_add_empty, btn_insert, btn_del, btn_export, btn_mark_dead, btn_restore_dead, self.btn_create_acc, self.btn_task3, btn_xoa, self.btn_toggle_log]:
             toolbar.addWidget(b)
         toolbar.addStretch()
 
@@ -1393,8 +1476,9 @@ class AccountsTab(QWidget):
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._context_menu)
         self.table.row_moved.connect(self._move_row)
+        self.table.hover_row_changed.connect(self._on_table_hover_row_changed)
         # col widths
-        widths = [120,200,110,90,220,220,220,80,80,80,80,110,110,100,160,200,120,120,140]
+        widths = [120,200,120,110,90,220,220,220,80,80,80,80,110,110,100,160,200,120,140]
         for i,w in enumerate(widths):
             self.table.setColumnWidth(i, w)
 
@@ -1455,18 +1539,15 @@ class AccountsTab(QWidget):
         self._set_cell_text(row, status_col, text, center=True)
         item = self.table.item(row, status_col)
         if item:
-            color_map = {"✅":"#22c55e","❌":"#ef4444","⏳":"#f59e0b","⏰":"#f59e0b"}
-            widget = self.table.cellWidget(row, 1)
+            color_map = {"DIE":"#ef4444","☠":"#ef4444","✅":"#22c55e","❌":"#ef4444","⏳":"#f59e0b","⏰":"#f59e0b","⚠":"#f59e0b"}
             matched = False
             for k,v in color_map.items():
                 if text.startswith(k):
-                    item.setForeground(QColor(v))
-                    if widget:
-                        widget.setStyleSheet(f"color:{v};")
+                    self._set_cell_base_color(row, status_col, v)
                     matched = True
                     break
-            if not matched and widget:
-                widget.setStyleSheet("")
+            if not matched:
+                self._set_cell_base_color(row, status_col, "")
 
     def _set_cell_text(self, row: int, col: int, value, center=False):
         text = str(value if value is not None else "")
@@ -1491,6 +1572,72 @@ class AccountsTab(QWidget):
         widget.setText(text)
         widget.setAlignment(Qt.AlignCenter if center else Qt.AlignLeft)
         widget.setCursorPosition(0)
+        widget.setProperty("baseColor", widget.property("baseColor") or "")
+        self._apply_cell_style(widget, row == self._hover_row)
+
+    def _default_text_color(self):
+        theme = self.settings_tab.get_settings().get("theme", "dark")
+        return "#0f172a" if theme == "light" else "#e2e8f0"
+
+    def _hover_bg_color(self):
+        return "#2563eb"
+
+    def _cell_style(self, text_color: str, bg_color: str = "transparent", font_weight: str = "400"):
+        return (
+            f"background:{bg_color};"
+            "border:none;border-radius:0;"
+            "padding:4px 6px;"
+            f"color:{text_color};"
+            f"font-weight:{font_weight};"
+        )
+
+    def _apply_cell_style(self, widget, hovered: bool):
+        if hovered:
+            widget.setStyleSheet(self._cell_style("#ffffff", self._hover_bg_color(), "700"))
+            return
+        color = widget.property("baseColor") or self._default_text_color()
+        widget.setStyleSheet(self._cell_style(color))
+
+    def _set_cell_base_color(self, row: int, col: int, color: str):
+        widget = self.table.cellWidget(row, col)
+        if isinstance(widget, QLineEdit):
+            widget.setProperty("baseColor", color or "")
+            self._apply_cell_style(widget, row == self._hover_row)
+        item = self.table.item(row, col)
+        if item and color:
+            item.setForeground(QColor(color))
+        elif item:
+            item.setForeground(QColor(self._default_text_color()))
+
+    def _apply_row_style(self, row: int):
+        if row < 0 or not hasattr(self, "table") or row >= self.table.rowCount():
+            return
+        hovered = row == self._hover_row
+        for col in range(self.table.columnCount()):
+            widget = self.table.cellWidget(row, col)
+            if isinstance(widget, QLineEdit):
+                self._apply_cell_style(widget, hovered)
+            item = self.table.item(row, col)
+            if item and hovered:
+                item.setBackground(QColor(self._hover_bg_color()))
+                item.setForeground(QColor("#ffffff"))
+            elif item:
+                item.setBackground(QColor("transparent"))
+                base_color = ""
+                if isinstance(widget, QLineEdit):
+                    base_color = widget.property("baseColor") or ""
+                item.setForeground(QColor(base_color or self._default_text_color()))
+
+    def _on_table_hover_row_changed(self, row: int):
+        previous = self._hover_row
+        self._hover_row = row
+        self._apply_row_style(previous)
+        self._apply_row_style(row)
+
+    def refresh_theme_styles(self):
+        self._hover_row = -1
+        for row in range(self.table.rowCount()):
+            self._apply_row_style(row)
 
     def _on_search_changed(self):
         self.current_page = 0
@@ -1632,6 +1779,8 @@ class AccountsTab(QWidget):
     def _run_row(self, row: int, script: str):
         if row in self.workers and self.workers[row].isRunning():
             return
+        if self._is_dead_row(row, notify=True):
+            return
         acc     = self.accounts[row]
         self._run_row_with_acc(row, script, acc)
 
@@ -1639,6 +1788,7 @@ class AccountsTab(QWidget):
         proxy   = self._next_proxy()
         sett    = self.settings_tab.get_settings()
         worker  = Worker(script, row, acc, sett, proxy)
+        worker.source_script = script
         worker.status_update.connect(self._set_status)
         worker.groups_update.connect(self._on_worker_groups_update)
         worker.info_update.connect(self._on_worker_info_update)
@@ -1650,6 +1800,8 @@ class AccountsTab(QWidget):
     def _run_row_group(self, row: int, script: str, group_id: str):
         if row in self.workers and self.workers[row].isRunning():
             return
+        if self._is_dead_row(row, notify=True):
+            return
         acc = dict(self.accounts[row])
         acc["group_id"] = str(group_id or "").strip()
         self._run_row_with_acc(row, script, acc)
@@ -1657,10 +1809,13 @@ class AccountsTab(QWidget):
     def _check_groups_row(self, row: int):
         if row in self.workers and self.workers[row].isRunning():
             return
+        if self._is_dead_row(row, notify=True):
+            return
         acc = dict(self.accounts[row])
         proxy = self._next_proxy()
         sett = self.settings_tab.get_settings()
         worker = CheckGroupWorker(row, acc, sett, proxy)
+        worker.source_script = "CheckNhom"
         worker.status_update.connect(self._set_status)
         worker.groups_update.connect(self._on_worker_groups_update)
         worker.info_update.connect(self._on_worker_info_update)
@@ -1706,6 +1861,83 @@ class AccountsTab(QWidget):
     def _run_all(self, script: str, label: str):
         for r in range(len(self.accounts)):
             self._run_row(r, script)
+
+    def _is_dead_row(self, row: int, notify: bool = False):
+        if row >= len(self.accounts):
+            return False
+        acc = self.accounts[row]
+        if not acc.get("is_dead"):
+            return False
+        if notify:
+            mail = acc.get("mail", f"dòng {row + 1}")
+            self._append_log(row, "SKIP", "Bỏ qua vì account đã được đánh dấu DIE")
+            QMessageBox.information(self, "Acc DIE", f"{mail} đang nằm trong danh sách acc chết.")
+        return True
+
+    def _mark_account_dead(self, row: int, reason: str, source: str = "", force: bool = False):
+        if row >= len(self.accounts):
+            return False
+        acc = self.accounts[row]
+        acc["last_error"] = str(reason or "").strip()
+        current_count = int(acc.get("dead_count") or 0)
+        if force or is_dead_login_error(reason):
+            current_count += 1
+        acc["dead_count"] = current_count
+
+        if force or current_count >= DEAD_LOGIN_THRESHOLD:
+            acc["is_dead"] = True
+            acc["dead_reason"] = str(reason or "Login không thành công").strip()
+            acc["dead_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            acc["dead_source"] = source or "Manual"
+            acc["status"] = "DIE"
+            self._set_status(row, "DIE")
+            self._append_log(row, source or "DIE", f"Đánh dấu DIE: {acc['dead_reason']}")
+            self._update_row(row, acc)
+            save_accounts(self.accounts)
+            self._apply_filter()
+            self.dead_accounts_changed.emit()
+            return True
+
+        save_accounts(self.accounts)
+        return False
+
+    def _restore_account(self, row: int):
+        if row >= len(self.accounts):
+            return
+        acc = self.accounts[row]
+        acc["is_dead"] = False
+        acc["dead_reason"] = ""
+        acc["dead_at"] = ""
+        acc["dead_source"] = ""
+        acc["dead_count"] = 0
+        acc["last_error"] = ""
+        acc["status"] = "Mới"
+        self._update_row(row, acc)
+        save_accounts(self.accounts)
+        self._apply_filter()
+        self.dead_accounts_changed.emit()
+
+    def mark_selected_dead(self):
+        rows = self._target_rows()
+        if not rows:
+            QMessageBox.information(self, "Thông báo", "Vui lòng chọn ít nhất một dòng.")
+            return
+        if QMessageBox.question(
+            self, "Đánh dấu DIE",
+            f"Đánh dấu {len(rows)} tài khoản là DIE?",
+            QMessageBox.Yes | QMessageBox.No
+        ) != QMessageBox.Yes:
+            return
+        for row in rows:
+            self._mark_account_dead(row, "Đánh dấu thủ công", "Manual", force=True)
+
+    def restore_selected_dead(self):
+        rows = self._target_rows()
+        if not rows:
+            QMessageBox.information(self, "Thông báo", "Vui lòng chọn ít nhất một dòng.")
+            return
+        for row in rows:
+            self._restore_account(row)
 
     def _parse_groups_text(self, groups_text: str):
         groups = []
@@ -1762,6 +1994,19 @@ class AccountsTab(QWidget):
         self._set_status(row, result)
         if row < len(self.accounts):
             self.accounts[row]["status"] = result
+            source = getattr(self.workers.get(row), "source_script", "")
+            if result.startswith("✅"):
+                self.accounts[row]["dead_count"] = 0
+                self.accounts[row]["last_error"] = ""
+            elif is_dead_login_error(result):
+                marked = self._mark_account_dead(row, result, source)
+                if not marked:
+                    count = int(self.accounts[row].get("dead_count") or 0)
+                    self.accounts[row]["status"] = f"⚠️ Login lỗi {count}/{DEAD_LOGIN_THRESHOLD}"
+                    self._set_status(row, self.accounts[row]["status"])
+                    self._append_log(row, source or "DIE", f"Login lỗi {count}/{DEAD_LOGIN_THRESHOLD}, chưa đánh dấu DIE")
+            elif result.startswith(("❌", "⏰")):
+                self.accounts[row]["last_error"] = result
             save_accounts(self.accounts)
         
         # Check if this was part of a sequential workflow
@@ -1958,6 +2203,7 @@ class AccountsTab(QWidget):
                 self.accounts.pop(r)
         save_accounts(self.accounts)
         self._apply_filter()
+        self.dead_accounts_changed.emit()
 
     # ── context menu ───────────────────────────────────────────────────────────
     def _context_menu(self, pos):
@@ -1985,6 +2231,14 @@ class AccountsTab(QWidget):
             a_edit = QAction("✏️  Chỉnh sửa dòng này", self)
             a_edit.triggered.connect(lambda: self._edit_row(row))
             menu.addAction(a_edit)
+
+            a_mark_dead = QAction("☠  Đánh dấu acc DIE", self)
+            a_mark_dead.triggered.connect(lambda: self._mark_account_dead(row, "Đánh dấu thủ công", "Manual", force=True))
+            menu.addAction(a_mark_dead)
+
+            a_restore = QAction("♻  Khôi phục acc", self)
+            a_restore.triggered.connect(lambda: self._restore_account(row))
+            menu.addAction(a_restore)
 
             menu.addSeparator()
             a_create = QAction("▶  Tạo tài khoản  (test1.py)", self)
@@ -2058,10 +2312,13 @@ class AccountsTab(QWidget):
             self.accounts.pop(row)
         save_accounts(self.accounts)
         self._apply_filter()
+        self.dead_accounts_changed.emit()
 
     def _show_lp_info(self, row: int, group_id: str = ""):
         """Login và hiển thị LP + danh sách SĐT của tài khoản"""
         if row >= len(self.accounts):
+            return
+        if self._is_dead_row(row, notify=True):
             return
         acc = dict(self.accounts[row])
         if group_id:
@@ -2074,7 +2331,14 @@ class AccountsTab(QWidget):
 
         worker = LPInfoWorker(acc, sett)
         worker.finished.connect(lambda lp, phones: dlg.set_result(lp, phones))
-        worker.error.connect(lambda msg: dlg.set_error(msg))
+        def on_error(msg: str):
+            dlg.set_error(msg)
+            if is_dead_login_error(msg):
+                self._mark_account_dead(row, msg, "Xem LP")
+            else:
+                self.accounts[row]["last_error"] = msg
+                save_accounts(self.accounts)
+        worker.error.connect(on_error)
         worker.start()
         # Giữ reference tránh bị GC
         self._lp_worker = worker
@@ -2084,6 +2348,8 @@ class AccountsTab(QWidget):
     def _create_lp(self, row: int, group_id: str = ""):
         """Mở dialog nhập số LP → chạy worker → lưu mã số vào cột lp_code"""
         if row >= len(self.accounts):
+            return
+        if self._is_dead_row(row, notify=True):
             return
         acc  = dict(self.accounts[row])
         if group_id:
@@ -2101,20 +2367,223 @@ class AccountsTab(QWidget):
                 dlg.set_result(code)
                 # Lưu mã số vào data và bảng
                 self.accounts[row]["lp_code"] = code
+                self.accounts[row]["dead_count"] = 0
+                self.accounts[row]["last_error"] = ""
                 lp_col = ACC_KEYS.index("lp_code")
                 self._set_cell_text(row, lp_col, code)
-                item = self.table.item(row, lp_col)
-                if item:
-                    item.setForeground(QColor("#22c55e"))
+                self._set_cell_base_color(row, lp_col, "#22c55e")
                 save_accounts(self.accounts)
 
+            def on_error(msg: str):
+                dlg.set_error(msg)
+                if is_dead_login_error(msg):
+                    self._mark_account_dead(row, msg, "Tạo LP")
+                else:
+                    self.accounts[row]["last_error"] = msg
+                    save_accounts(self.accounts)
+
             worker.finished.connect(on_done)
-            worker.error.connect(dlg.set_error)
+            worker.error.connect(on_error)
             worker.start()
             self._lp_charge_worker = worker  # giữ reference
 
         dlg.do_charge.connect(on_charge)
         dlg.exec_()
+
+# ── Dead accounts tab ─────────────────────────────────────────────────────────
+class DeadAccountsTab(QWidget):
+    def __init__(self, accounts_tab: AccountsTab, parent=None):
+        super().__init__(parent)
+        self.accounts_tab = accounts_tab
+        self.dead_rows = []
+        self.filtered_rows = []
+        self._hover_row = -1
+        self._build_ui()
+        self.refresh()
+        self.accounts_tab.dead_accounts_changed.connect(self.refresh)
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(8)
+        self.btn_refresh = QPushButton("Làm mới")
+        self.btn_refresh.clicked.connect(self.refresh)
+        self.btn_restore = QPushButton("♻  Khôi phục")
+        self.btn_restore.clicked.connect(self.restore_selected)
+        self.btn_export = QPushButton("📤  Xuất Excel")
+        self.btn_export.clicked.connect(self.export_dead)
+        self.btn_delete = QPushButton("🗑  Xóa vĩnh viễn")
+        self.btn_delete.setObjectName("btnDanger")
+        self.btn_delete.clicked.connect(self.delete_selected)
+        for button in [self.btn_refresh, self.btn_restore, self.btn_export, self.btn_delete]:
+            toolbar.addWidget(button)
+        toolbar.addStretch()
+        self.lbl_count = QLabel("0 acc DIE")
+        self.lbl_count.setStyleSheet("color:#ef4444;font-weight:700;")
+        toolbar.addWidget(self.lbl_count)
+        layout.addLayout(toolbar)
+
+        search_row = QHBoxLayout()
+        search_row.setSpacing(8)
+        search_row.addWidget(QLabel("Tìm kiếm"))
+        self.e_search = QLineEdit()
+        self.e_search.setPlaceholderText("Nhập email, lý do, nguồn, group...")
+        self.e_search.textChanged.connect(self._apply_filter)
+        search_row.addWidget(self.e_search, 1)
+        layout.addLayout(search_row)
+
+        self.table = HoverTable(0, len(DEAD_COLS))
+        self.table.setHorizontalHeaderLabels(DEAD_COLS)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.verticalHeader().setDefaultSectionSize(34)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.hover_row_changed.connect(self._on_table_hover_row_changed)
+        widths = [220, 90, 260, 150, 110, 90, 260, 110, 180]
+        for i, width in enumerate(widths):
+            self.table.setColumnWidth(i, width)
+        layout.addWidget(self.table, 1)
+
+    def refresh(self):
+        self.dead_rows = [
+            row for row, acc in enumerate(self.accounts_tab.accounts)
+            if acc.get("is_dead")
+        ]
+        self._apply_filter()
+
+    def _apply_filter(self):
+        if not hasattr(self, "table"):
+            return
+        query = self.e_search.text().strip().lower() if hasattr(self, "e_search") else ""
+        self.filtered_rows = []
+        for row in self.dead_rows:
+            acc = self.accounts_tab.accounts[row]
+            haystack = " ".join(str(acc.get(key, "")) for key in DEAD_KEYS).lower()
+            if not query or query in haystack:
+                self.filtered_rows.append(row)
+        self._load_table()
+
+    def _load_table(self):
+        self.table.setRowCount(0)
+        for account_row in self.filtered_rows:
+            acc = self.accounts_tab.accounts[account_row]
+            table_row = self.table.rowCount()
+            self.table.insertRow(table_row)
+            for col, key in enumerate(DEAD_KEYS):
+                value = acc.get(key, "")
+                item = QTableWidgetItem(str(value if value is not None else ""))
+                item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                item.setData(Qt.UserRole, account_row)
+                if key in ("status", "dead_count"):
+                    item.setTextAlignment(Qt.AlignCenter | Qt.AlignVCenter)
+                if key == "status":
+                    item.setForeground(QColor("#ef4444"))
+                self.table.setItem(table_row, col, item)
+            self._apply_row_style(table_row)
+        total = len(self.dead_rows)
+        shown = len(self.filtered_rows)
+        self.lbl_count.setText(f"{shown}/{total} acc DIE" if shown != total else f"{total} acc DIE")
+
+    def _default_text_color(self):
+        theme = self.accounts_tab.settings_tab.get_settings().get("theme", "dark")
+        return "#0f172a" if theme == "light" else "#e2e8f0"
+
+    def _apply_row_style(self, row: int):
+        if row < 0 or row >= self.table.rowCount():
+            return
+        hovered = row == self._hover_row
+        for col in range(self.table.columnCount()):
+            item = self.table.item(row, col)
+            if not item:
+                continue
+            if hovered:
+                item.setBackground(QColor("#2563eb"))
+                item.setForeground(QColor("#ffffff"))
+                item.setFont(QFont("", -1, QFont.Bold))
+            else:
+                item.setBackground(QColor("transparent"))
+                item.setForeground(QColor("#ef4444") if col == DEAD_KEYS.index("status") else QColor(self._default_text_color()))
+                item.setFont(QFont("", -1, QFont.Normal))
+
+    def _on_table_hover_row_changed(self, row: int):
+        previous = self._hover_row
+        self._hover_row = row
+        self._apply_row_style(previous)
+        self._apply_row_style(row)
+
+    def refresh_theme_styles(self):
+        self._hover_row = -1
+        for row in range(self.table.rowCount()):
+            self._apply_row_style(row)
+
+    def _selected_account_rows(self):
+        rows = sorted({index.row() for index in self.table.selectedIndexes()})
+        result = []
+        for table_row in rows:
+            item = self.table.item(table_row, 0)
+            if item is None:
+                continue
+            account_row = item.data(Qt.UserRole)
+            if isinstance(account_row, int):
+                result.append(account_row)
+        return result
+
+    def restore_selected(self):
+        rows = self._selected_account_rows()
+        if not rows:
+            QMessageBox.information(self, "Thông báo", "Vui lòng chọn ít nhất một acc DIE.")
+            return
+        for row in rows:
+            self.accounts_tab._restore_account(row)
+        self.refresh()
+
+    def delete_selected(self):
+        rows = sorted(self._selected_account_rows(), reverse=True)
+        if not rows:
+            QMessageBox.information(self, "Thông báo", "Vui lòng chọn ít nhất một acc DIE.")
+            return
+        if QMessageBox.question(
+            self,
+            "Xóa acc DIE",
+            f"Xóa vĩnh viễn {len(rows)} tài khoản khỏi accounts.json?",
+            QMessageBox.Yes | QMessageBox.No
+        ) != QMessageBox.Yes:
+            return
+        for row in rows:
+            if row < len(self.accounts_tab.accounts):
+                self.accounts_tab.accounts.pop(row)
+        self.accounts_tab._load_table()
+        save_accounts(self.accounts_tab.accounts)
+        self.accounts_tab.dead_accounts_changed.emit()
+        self.refresh()
+
+    def export_dead(self):
+        rows = [self.accounts_tab.accounts[row] for row in self.filtered_rows]
+        if not rows:
+            QMessageBox.information(self, "Thông báo", "Không có acc DIE để xuất.")
+            return
+        default_name = datetime.now().strftime("acc-die-%d-%m-%Y.xlsx")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Chọn nơi lưu file Acc DIE",
+            os.path.join(BASE, default_name),
+            "Excel Workbook (*.xlsx)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+        try:
+            self.accounts_tab._write_xlsx(path, DEAD_COLS, DEAD_KEYS, rows)
+            QMessageBox.information(self, "Xuất xong", f"Đã xuất {len(rows)} acc DIE:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Lỗi xuất file", str(e))
 
 # ── Main window ────────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
@@ -2126,8 +2595,10 @@ class MainWindow(QMainWindow):
         self.settings_tab  = SettingsTab()
         self.settings = self.settings_tab.settings
         self.accounts_tab  = AccountsTab(self.settings_tab)
+        self.dead_tab      = DeadAccountsTab(self.accounts_tab)
         self.get_code_tab  = GetCodeTab(self.settings_tab)
         tabs.addTab(self.accounts_tab, "📋  Tài khoản & Chạy")
+        tabs.addTab(self.dead_tab, "☠  Acc DIE")
         tabs.addTab(self.get_code_tab, "📨  GetCode")
         tabs.addTab(self.settings_tab, "⚙️  Cài đặt")
         self.setCentralWidget(tabs)
@@ -2150,6 +2621,10 @@ class MainWindow(QMainWindow):
         else:
             self.btn_theme.setText("☾")
             self.statusBar().setStyleSheet("background:#1a2035;color:#60a5fa;font-size:12px;padding:2px 10px;")
+        if hasattr(self, "accounts_tab"):
+            self.accounts_tab.refresh_theme_styles()
+        if hasattr(self, "dead_tab"):
+            self.dead_tab.refresh_theme_styles()
 
     def _toggle_theme(self):
         next_theme = "light" if self.settings.get("theme", "dark") != "light" else "dark"
